@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM 辩论竞技场</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app-container">
+  <header>
+    <div class="logo">
+      <span class="logo-icon">⚔️</span>
+      <h1>LLM 辩论竞技场</h1>
+    </div>
+    <button class="btn-icon" id="settingsBtn" title="设置">⚙️</button>
+  </header>
+
+  <div class="question-bar">
+    <textarea id="questionInput" placeholder="输入你的问题，让多个大模型展开辩论..." rows="2"></textarea>
+    <button class="btn-start" id="startBtn">⚡ 开始辩论</button>
+  </div>
+
+  <div class="config-summary" id="configSummary">
+    <span id="modelCountText">已选择 0 个模型</span>
+    <span id="roundCountText">3 轮辩论</span>
+  </div>
+
+  <div class="progress-bar" id="progressBar" style="display:none">
+    <div class="progress-fill" id="progressFill"></div>
+    <span class="progress-text" id="progressText"></span>
+  </div>
+
+  <div class="arena" id="arena"></div>
+
+  <div class="judge-panel" id="judgePanel" style="display:none"></div>
+</div>
+
+<div class="modal-overlay" id="settingsModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>辩论设置</h2>
+      <button class="btn-icon" id="closeSettings">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>vLLM 服务地址</label>
+        <input type="text" id="vllmUrl" value="http://localhost:8000/v1" placeholder="http://localhost:8000/v1">
+        <button class="btn-secondary" id="testConnBtn">测试连接</button>
+        <span id="connStatus"></span>
+        <div id="modelList" class="model-list"></div>
+      </div>
+      <div class="form-group">
+        <label>DeepSeek API 密钥</label>
+        <input type="text" id="deepseekApiKey" placeholder="sk-..." value="">
+        <button class="btn-secondary" id="testDSBtn">测试 DeepSeek 连接</button>
+        <span id="dsStatus"></span>
+      </div>
+      <div class="form-group">
+        <label>辩论轮数</label>
+        <input type="number" id="roundsInput" value="10" min="5" max="50">
+      </div>
+      <div class="form-group">
+        <label>Temperature</label>
+        <input type="number" id="temperatureInput" value="0.7" min="0" max="2" step="0.1">
+      </div>
+      <div class="form-group">
+        <label>最大 Token 数</label>
+        <input type="number" id="maxTokensInput" value="16384" min="256" max="1048576" step="256">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-primary" id="saveSettingsBtn">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
