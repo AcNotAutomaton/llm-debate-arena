@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 
@@ -32,34 +33,20 @@ function getPhaseName(round, total) {
   return '\u653b\u8fa9\u8fa9\u8bba';
 }
 
-function buildSystemPrompt(modelName, round, totalRounds) {
-  const phase = getPhaseName(round, totalRounds);
-  const base = `\u4f60\u662f ${modelName}\uff0c\u4e00\u4f4d\u77e5\u8bc6\u6e0a\u535a\u3001\u903b\u8f91\u6e05\u6670\u7684\u4e13\u5bb6\u3002\u8bf7\u7528\u4e2d\u6587\u56de\u7b54\u3002`;
-  if (round === 1) return `${base}\n\n\u73b0\u5728\u662f\u300c${phase}\u300d\u9636\u6bb5\u3002\u8bf7\u76f4\u63a5\u9488\u5bf9\u95ee\u9898\u7ed9\u51fa\u4f60\u7684\u5168\u9762\u5206\u6790\u548c\u89c2\u70b9\u3002`;
-  if (round === totalRounds) return `${base}\n\n\u73b0\u5728\u662f\u300c${phase}\u300d\u9636\u6bb5\u3002\u8bf7\u56de\u987e\u6574\u573a\u8fa9\u8bba\uff0c\u603b\u7ed3\u4f60\u7684\u6838\u5fc3\u8bba\u70b9\uff0c\u5e76\u7ed9\u51fa\u6700\u7ec8\u7ed3\u8bba\u3002`;
-  return `${base}\n\n\u73b0\u5728\u662f\u300c${phase}\u300d\u9636\u6bb5\u3002\u8bf7\u9488\u5bf9\u5176\u4ed6\u4e13\u5bb6\u7684\u89c2\u70b9\u8fdb\u884c\u5206\u6790\u3001\u56de\u5e94\u548c\u53cd\u9a73\u3002`;
+function buildSystemPrompt(modelName, stepNum, totalSteps) {
+  const base = `你是 ${modelName}，一位知识渊博、逻辑清晰的专家。请用中文回答。`;
+  if (stepNum === 1) return `${base}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
+  return `${base}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
 }
 
-function buildUserPrompt(question, modelName, round, totalRounds, history) {
-  if (round === 1) return question;
-  let other = '';
-  for (const [name, rounds] of history) {
-    if (name === modelName) continue;
-    const prev = rounds.find(r => r.round === round - 1);
-    if (prev) other += `\n\u3010${name} \u7684\u89c2\u70b9\u3011\n${prev.content.substring(0, 1000)}\n`;
+function buildUserPrompt(question, modelName, history) {
+  if (history.length === 0) return question;
+  let context = `问题：${question}\n\n`;
+  for (const entry of history) {
+    context += `---\n**${entry.model}**:\n${entry.content}\n\n`;
   }
-  let myH = '';
-  const myR = history.get(modelName);
-  if (myR) myH = myR.map(r => `\u7b2c${r.round}\u8f6e\uff1a${r.content.substring(0, 500)}`).join('\n\n');
-  if (round < totalRounds) {
-    return `\u95ee\u9898\uff1a${question}\n\n\u5176\u4ed6\u4e13\u5bb6\u7684\u89c2\u70b9\uff1a\n${other}\n\n\u4f60\u7684\u4e0a\u4e00\u8f6e\u56de\u7b54\uff1a\n${myH}\n\n\u8bf7\u9488\u5bf9\u5176\u4ed6\u4e13\u5bb6\u7684\u89c2\u70b9\u8fdb\u884c\u5206\u6790\u3001\u53cd\u9a73\u6216\u8865\u5145\u3002`;
-  }
-  let full = '';
-  for (const [name, rounds] of history) {
-    full += `\n=== ${name} \u7684\u8fa9\u8bba\u8bb0\u5f55 ===\n`;
-    for (const r of rounds) full += `\u7b2c${r.round}\u8f6e\uff1a${r.content}\n`;
-  }
-  return `\u95ee\u9898\uff1a${question}\n\n\u6574\u573a\u8fa9\u8bba\u56de\u987e\uff1a\n${full}\n\n\u8bf7\u505a\u51fa\u4f60\u7684\u603b\u7ed3\u9648\u8bcd\u3002`;
+  context += `---\n\n现在轮到 ${modelName} 回答。请基于之前所有回答继续深入分析，提出你的观点。`;
+  return context;
 }
 
 async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, apiKey) {
@@ -188,32 +175,55 @@ async function startDebate(debateId) {
   const s = sessions.get(debateId);
   if (!s) return;
   s.status = 'running';
-  s.history = new Map();
-  for (const m of s.models) s.history.set(m.name, []);
-  emit(debateId, 'debate-start', { question: s.question, models: s.models, totalRounds: s.rounds });
-  for (let r = 1; r <= s.rounds; r++) {
-    const phase = getPhaseName(r, s.rounds);
-    emit(debateId, 'round-start', { round: r, totalRounds: s.rounds, phase });
-    await Promise.all(s.models.map(async (model) => {
-      emit(debateId, 'model-start', { model: model.name, round: r });
-      const msgs = [
-        { role: 'system', content: buildSystemPrompt(model.name, r, s.rounds) },
-        { role: 'user', content: buildUserPrompt(s.question, model.name, r, s.rounds, s.history) }
-      ];
-      const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
-      try {
-        const text = await callModel(callConfig, model.id, msgs, s.temperature, s.maxTokens, debateId, model.name, r);
-        s.history.get(model.name).push({ round: r, phase, content: text });
-        emit(debateId, 'model-done', { model: model.name, round: r, fullText: text });
-      } catch (err) {
-        s.history.get(model.name).push({ round: r, phase, content: `[${model.name}] \u751f\u6210\u5931\u8d25: ${err.message}` });
-        emit(debateId, 'model-error', { model: model.name, round: r, error: err.message });
-      }
-    }));
-    emit(debateId, 'round-end', { round: r });
+  s.history = [];
+  const totalSteps = s.rounds * s.models.length;
+  emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps });
+  for (let step = 0; step < totalSteps; step++) {
+    const model = s.models[step % s.models.length];
+    const turnNum = step + 1;
+    emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name });
+    const msgs = [
+      { role: 'system', content: buildSystemPrompt(model.name, turnNum, totalSteps) },
+      { role: 'user', content: buildUserPrompt(s.question, model.name, s.history) }
+    ];
+    emit(debateId, 'model-start', { model: model.name, round: turnNum });
+    const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
+    try {
+      const text = await callModel(callConfig, model.id, msgs, s.temperature, s.maxTokens, debateId, model.name, turnNum);
+      s.history.push({ model: model.name, step: turnNum, content: text });
+      emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text });
+    } catch (err) {
+      s.history.push({ model: model.name, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
+      emit(debateId, 'model-error', { model: model.name, round: turnNum, error: err.message });
+    }
+    emit(debateId, 'round-end', { turn: turnNum, totalTurns: totalSteps });
   }
-  const result = await runJudge(debateId, s);
-  emit(debateId, 'debate-end', result);
+  s.status = 'completed';
+  try {
+    await runJudge(debateId, s);
+  } catch (e) {
+    emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '' });
+  }
+  try {
+    const dir = require('path').join(__dirname, 'debates');
+    if (!require('fs').existsSync(dir)) require('fs').mkdirSync(dir, { recursive: true });
+    const now = new Date();
+    const filename = now.getFullYear() + '-' +
+      String(now.getMonth()+1).padStart(2,'0') + '-' +
+      String(now.getDate()).padStart(2,'0') + '_' +
+      String(now.getHours()).padStart(2,'0') + '-' +
+      String(now.getMinutes()).padStart(2,'0') + '-' +
+      String(now.getSeconds()).padStart(2,'0') + '.md';
+    let md = '# LLM \u8fa9\u8bba\u8bb0\u5f55\n\n';
+    md += '**\u95ee\u9898**: ' + s.question + '\n\n';
+    md += '**\u53c2\u4e0e\u6a21\u578b**: ' + s.models.map(m => m.name).join(', ') + '\n\n---\n\n';
+    for (let i = 0; i < s.history.length; i++) {
+      md += '## \u7b2c' + (i+1) + '\u6b65 - ' + s.history[i].model + '\n\n';
+      md += s.history[i].content + '\n\n---\n\n';
+    }
+    require('fs').writeFileSync(require('path').join(dir, filename), md, 'utf-8');
+    console.log('Debate saved: ' + filename);
+  } catch (e) { console.error('Save failed:', e.message); }
 }
 
 app.post('/api/test-connection', async (req, res) => {

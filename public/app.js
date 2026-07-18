@@ -218,7 +218,7 @@ function getCardIndex(modelName) {
   return state.config.selectedModels.findIndex(m => m.name === modelName);
 }
 
-function addRoundLabel(cardIndex, round, phase) {
+function addRoundLabel(cardIndex, turn, model) {
   const body = document.getElementById("body-" + cardIndex);
   if (!body) return;
   const div = document.createElement("div");
@@ -270,11 +270,12 @@ function connectSSE(debateId, models) {
 
   es.addEventListener("round-start", (e) => {
     const data = JSON.parse(e.data);
-    const pct = ((data.round - 1) / state.config.rounds * 100);
+    const pct = ((data.turn - 1) / data.totalTurns * 100);
     progressFill.style.width = pct + "%";
-    progressText.textContent = "\u7b2c " + data.round + "/" + state.config.rounds + " \u8f6e \u00b7 " + data.phase;
-    models.forEach((m, i) => { addRoundLabel(i, data.round, data.phase); });
-  });
+    progressText.textContent = "第 " + data.turn + "/" + data.totalTurns + " 步 · " + data.model;
+    const idxMD = getCardIndex(data.model);
+    if (idxMD >= 0) { addRoundLabel(idxMD, data.turn, data.model); }
+  })
 
   es.addEventListener("model-start", (e) => {
     const data = JSON.parse(e.data);
@@ -309,10 +310,10 @@ function connectSSE(debateId, models) {
 
   es.addEventListener("round-end", (e) => {
     const data = JSON.parse(e.data);
-    const pct = (data.round / state.config.rounds * 100);
+    const pct = (data.turn / data.totalTurns * 100);
     progressFill.style.width = pct + "%";
-    progressText.textContent = "\u7b2c " + data.round + "/" + state.config.rounds + " \u8f6e \u5df2\u5b8c\u6210";
-  });
+    progressText.textContent = "第 " + data.turn + "/" + data.totalTurns + " 步已完成";
+  })
 
   es.addEventListener("judge-start", () => {
     progressText.textContent = "\u88c1\u5224\u8bc4\u5206\u4e2d...";
