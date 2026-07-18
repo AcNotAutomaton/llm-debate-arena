@@ -50,6 +50,7 @@ const progressFill = q("#progressFill");
 const progressText = q("#progressText");
 const modelCountText = q("#modelCountText");
 const roundCountText = q("#roundCountText");
+const themeToggle = q("#themeToggle");
 
 settingsBtn.onclick = () => settingsModal.classList.add("active");
 closeSettings.onclick = () => settingsModal.classList.remove("active");
@@ -373,3 +374,17 @@ updateConfigSummary();
     if (data.success) { state.config.models = data.models; renderModelList(); }
   } catch {}
 })();
+
+
+// Theme toggle
+const savedTheme = localStorage.getItem("theme") || "dark";
+document.documentElement.setAttribute("data-theme", savedTheme);
+themeToggle.textContent = savedTheme === "dark" ? "🌙" : "☀️";
+
+themeToggle.onclick = () => {
+  const current = document.documentElement.getAttribute("data-theme");
+  const next = current === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  localStorage.setItem("theme", next);
+  themeToggle.textContent = next === "dark" ? "🌙" : "☀️";
+};

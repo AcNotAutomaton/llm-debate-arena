@@ -92,6 +92,7 @@ async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, deba
     }
   }
   return full;
+}
 
 async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
@@ -137,7 +138,6 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
   return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
 }
 
-}
 
 async function runJudge(debateId, session) {
   emit(debateId, 'judge-start', {});
