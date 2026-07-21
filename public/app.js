@@ -351,10 +351,15 @@ function connectSSE(debateId, models) {
     es.close();
     state.eventSource = null;
   })
-  html += "</div>";
+}
+
+function showResults(data) {
+  var html = '';
+  var judgeText = data.judgeText || '';
+  var evaluations = data.evaluations || [];
   if (judgeText) html += '<div class="judge-text">' + escapeHtml(judgeText) + "</div>";
   if (evaluations && evaluations.length > 0) {
-    html += '<div class="eval-section"><div class="eval-title">U0001F91D 模型互评</div>';
+    html += '<div class="eval-section"><div class="eval-title">🤝 模型互评</div>';
     for (var i = 0; i < evaluations.length; i++) {
       var ev = evaluations[i];
       html += '<div class="eval-card"><div class="eval-name">' + escapeHtml(ev.model) + '</div><div class="eval-text">' + escapeHtml(ev.evaluation) + '</div></div>';

@@ -231,6 +231,7 @@ async function startDebate(debateId) {
   } catch (e) { console.error('Eval failed:', e.message); }
   try {
     await runJudge(debateId, s);
+    emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
   } catch (e) {
     emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
   }
