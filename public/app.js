@@ -319,35 +319,48 @@ function connectSSE(debateId, models) {
     progressText.textContent = "\u88c1\u5224\u8bc4\u5206\u4e2d...";
   });
 
+  es.addEventListener("model-eval-start", () => {
+    progressText.textContent = "\u6a21\u578b\u4e92\u8bc4\u4e2d...";
+  });
+
+  es.addEventListener("model-evaluation", (e) => {
+    const data = JSON.parse(e.data);
+    const idx = getCardIndex(data.model);
+    if (idx >= 0) {
+      const body = document.getElementById("body-" + idx);
+      if (!body) return;
+      var msg = body.querySelector(".model-message:last-child");
+      if (!msg || !msg.dataset.streaming) {
+        msg = document.createElement("div");
+        msg.className = "model-message eval-msg";
+        msg.dataset.streaming = "true";
+        body.appendChild(msg);
+      }
+      msg.textContent = data.evaluation;
+      delete msg.dataset.streaming;
+      body.scrollTop = body.scrollHeight;
+    }
+  });
+
   es.addEventListener("debate-end", (e) => {
     const data = JSON.parse(e.data);
+    resetUI();
     progressFill.style.width = "100%";
     progressText.textContent = "\u8fa9\u8bba\u7ed3\u675f!";
     showResults(data);
     es.close();
     state.eventSource = null;
-    resetUI();
-  });
-
-  es.onerror = () => { resetUI(); };
-}
-
-function showResults(data) {
-  judgePanel.style.display = "block";
-  const { scores, winner, judgeText } = data;
-  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  let html = '<div class="judge-title">🏆 \u8fa9\u8bba\u7ed3\u679c</div><div class="judge-scores">';
-  sorted.forEach(([name, score], i) => {
-    const isWinner = name === winner;
-    const color = COLORS[state.config.selectedModels.findIndex(m => m.name === name) % COLORS.length];
-    html += '<div class="score-card">' +
-      '<div class="score-rank">' + (isWinner ? "🏆" : "#" + (i + 1)) + "</div>" +
-      '<div class="score-name" style="color:' + (color ? color.bg : "#e2e8f0") + '">' + name + (isWinner ? ' <span class="winner-badge">\u51a0\u519b</span>' : "") + "</div>" +
-      '<div class="score-value" style="color:' + (color ? color.bg : "#e2e8f0") + '">' + score.toFixed(1) + "</div>" +
-    "</div>";
-  });
+  })
   html += "</div>";
   if (judgeText) html += '<div class="judge-text">' + escapeHtml(judgeText) + "</div>";
+  if (evaluations && evaluations.length > 0) {
+    html += '<div class="eval-section"><div class="eval-title">U0001F91D 模型互评</div>';
+    for (var i = 0; i < evaluations.length; i++) {
+      var ev = evaluations[i];
+      html += '<div class="eval-card"><div class="eval-name">' + escapeHtml(ev.model) + '</div><div class="eval-text">' + escapeHtml(ev.evaluation) + '</div></div>';
+    }
+    html += '</div>';
+  }
   judgePanel.innerHTML = html;
 }
 

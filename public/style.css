@@ -180,6 +180,12 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
   padding: 12px; background: var(--bg-primary); border-radius: 8px; margin-top: 12px;
 }
 
+.eval-section { margin-top: 20px; }
+.eval-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.eval-card { background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+.eval-name { font-size: 13px; font-weight: 600; color: var(--accent-color, #818cf8); margin-bottom: 4px; }
+.eval-text { font-size: 13px; line-height: 1.6; color: var(--text-secondary); white-space: pre-wrap; }
+
 .modal-overlay {
   display: none; position: fixed; inset: 0; background: var(--modal-overlay);
   z-index: 1000; align-items: center; justify-content: center;

@@ -171,6 +171,33 @@ async function runJudge(debateId, session) {
   }
 }
 
+
+async function evaluateModels(debateId, session) {
+  emit(debateId, "model-eval-start", {});
+  var transcript = "";
+  for (var _i = 0; _i < session.history.length; _i++) {
+    var _e = session.history[_i];
+    transcript += _e.model + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
+  }
+  session.evaluations = [];
+  for (var _m = 0; _m < session.models.length; _m++) {
+    var model = session.models[_m];
+    var msgs = [
+      { role: "system", content: "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后说出你认为哪个模型表现最好。控制在200字以内。" },
+      { role: "user", content: "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型并指出谁表现最好。" }
+    ];
+    var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
+    try {
+      var text = await callModel(callConfig, model.id, msgs, 0.3, 512, debateId, model.name, "eval");
+      session.evaluations.push({ model: model.name, evaluation: text });
+      emit(debateId, "model-evaluation", { model: model.name, evaluation: text });
+    } catch (err) {
+      session.evaluations.push({ model: model.name, evaluation: "评价失败: " + err.message });
+      emit(debateId, "model-evaluation", { model: model.name, evaluation: "评价失败: " + err.message });
+    }
+  }
+}
+
 async function startDebate(debateId) {
   const s = sessions.get(debateId);
   if (!s) return;
@@ -200,9 +227,12 @@ async function startDebate(debateId) {
   }
   s.status = 'completed';
   try {
+    await evaluateModels(debateId, s);
+  } catch (e) { console.error('Eval failed:', e.message); }
+  try {
     await runJudge(debateId, s);
   } catch (e) {
-    emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '' });
+    emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
   }
   try {
     const dir = require('path').join(__dirname, 'debates');
@@ -220,6 +250,13 @@ async function startDebate(debateId) {
     for (let i = 0; i < s.history.length; i++) {
       md += '## \u7b2c' + (i+1) + '\u6b65 - ' + s.history[i].model + '\n\n';
       md += s.history[i].content + '\n\n---\n\n';
+    }
+    if (s.evaluations && s.evaluations.length > 0) {
+      md += "## 模型互评\n\n";
+      for (var k = 0; k < s.evaluations.length; k++) {
+        var ev = s.evaluations[k];
+        md += "**" + ev.model + "**：\n\n" + ev.evaluation + "\n\n---\n\n";
+      }
     }
     require('fs').writeFileSync(require('path').join(dir, filename), md, 'utf-8');
     console.log('Debate saved: ' + filename);
