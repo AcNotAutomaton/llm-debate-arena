@@ -48,17 +48,23 @@
     </div>
     <div class="modal-body">
       <div class="form-group">
+        <label>DeepSeek API 密钥</label>
+        <input type="text" id="deepseekApiKey" placeholder="sk-..." value="">
+        <button class="btn-secondary" id="testDSBtn">测试 DeepSeek 连接</button>
+        <span id="dsStatus"></span>
+      </div>
+      <div class="form-group">
+        <label>GLM API 密钥</label>
+        <input type="text" id="glmApiKey" placeholder="..." value="">
+        <button class="btn-secondary" id="testGLMBtn">测试 GLM 连接</button>
+        <span id="glmStatus"></span>
+      </div>
+            <div class="form-group">
         <label>vLLM 服务地址</label>
         <input type="text" id="vllmUrl" value="http://localhost:8000/v1" placeholder="http://localhost:8000/v1">
         <button class="btn-secondary" id="testConnBtn">测试连接</button>
         <span id="connStatus"></span>
         <div id="modelList" class="model-list"></div>
-      </div>
-      <div class="form-group">
-        <label>DeepSeek API 密钥</label>
-        <input type="text" id="deepseekApiKey" placeholder="sk-..." value="">
-        <button class="btn-secondary" id="testDSBtn">测试 DeepSeek 连接</button>
-        <span id="dsStatus"></span>
       </div>
       <div class="form-group">
         <label>辩论轮数</label>

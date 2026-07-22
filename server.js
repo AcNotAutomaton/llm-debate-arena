@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+const GLM_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
 
 const app = express();
 app.use(cors());
@@ -110,10 +111,42 @@ async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, max
   return full;
 }
 
+async function callGLM(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
+  const url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
+  const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
+  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  if (!resp.ok) throw new Error(`GLM 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let full = '', buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || !t.startsWith('data:')) continue;
+      const j = t.slice(5).trim();
+      if (j === '[DONE]') continue;
+      try {
+        const c = JSON.parse(j);
+        const tok = c.choices?.[0]?.delta?.content || '';
+        if (tok) { full += tok; emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
+      } catch {}
+    }
+  }
+  return full;
+}
+
 function getModelCallConfig(model, vllmBaseUrl) {
   const provider = model.provider || 'vllm';
   if (provider === 'deepseek') {
     return { provider: 'deepseek', baseUrl: model.baseUrl || DEEPSEEK_BASE_URL, apiKey: model.apiKey || process.env.DEEPSEEK_API_KEY || '' };
+  }
+  if (provider === 'glm') {
+    return { provider: 'glm', baseUrl: model.baseUrl || GLM_BASE_URL, apiKey: model.apiKey || process.env.GLM_API_KEY || '' };
   }
   return { provider: 'vllm', baseUrl: model.baseUrl || vllmBaseUrl, apiKey: model.apiKey || '' };
 }
@@ -121,6 +154,9 @@ function getModelCallConfig(model, vllmBaseUrl) {
 async function callModel(config, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   if (config.provider === 'deepseek') {
     return callDeepSeek(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
+  }
+  if (config.provider === 'glm') {
+    return callGLM(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
   }
   return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
 }
@@ -269,6 +305,17 @@ app.post('/api/test-connection', async (req, res) => {
   const prov = provider || 'vllm';
   if (prov === 'deepseek') {
     const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/models`;
+    try {
+      const headers = {};
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const resp = await fetch(url, { headers });
+      const data = await resp.json();
+      res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
+    } catch (err) { res.json({ success: false, error: err.message }); }
+    return;
+  }
+  if (prov === 'glm') {
+    const url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/models`;
     try {
       const headers = {};
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;

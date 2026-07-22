@@ -20,6 +20,8 @@
   --badge-vllm-text: #94a3b8;
   --badge-ds-bg: #1e3a5f;
   --badge-ds-text: #60a5fa;
+  --badge-glm-bg: #064e3b;
+  --badge-glm-text: #6ee7b7;
   --card-shadow: rgba(99,102,241,.1);
 }
 
@@ -44,6 +46,8 @@
   --badge-vllm-text: #475569;
   --badge-ds-bg: #dbeafe;
   --badge-ds-text: #2563eb;
+  --badge-glm-bg: #d1fae5;
+  --badge-glm-text: #047857;
   --card-shadow: rgba(99,102,241,.08);
 }
 
@@ -227,6 +231,7 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
 }
 .provider-badge.vllm { background: var(--btn-secondary-bg); color: var(--text-secondary); }
 .provider-badge.ds { background: #1e3a5f; color: #60a5fa; }
+.provider-badge.glm { background: var(--badge-glm-bg); color: var(--badge-glm-text); }
 
 .conn-status { font-size: 13px; margin-left: 8px; }
 .conn-success { color: #22c55e; }
