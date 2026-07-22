@@ -7,7 +7,7 @@
 ## 功能特点
 
 - **链式辩论**：模型依次发言，后一个模型基于前一个的回答继续分析，形成深度对话链条
-- **多 Provider 混用**：同时支持本地 vLLM 服务和 DeepSeek 云端 API，两种来源的模型可以同台辩论
+- **多 Provider 混用**：同时支持本地 vLLM 服务、DeepSeek 云端 API 和 GLM（智谱）云端 API，多种来源的模型可以同台辩论
 - **流式输出**：模型思考过程和回答实时推送到页面，无需等待
 - **自动记录**：每场辩论结束后自动在 `debates/` 目录生成 Markdown 文件，文件名精确到秒
 - **主题切换**：支持深色/浅色主题，右上角 🌙/☀️ 一键切换
@@ -38,7 +38,12 @@ node server.js
    - 点击「测试 DeepSeek 连接」
    - 在模型列表中勾选你要用的模型（如 `deepseek-v4-pro`、`deepseek-v4-flash`）
 
-2. **本地 vLLM 模型**（可选）：
+2. **GLM（智谱）模型**（推荐）：
+   - 在「GLM API 密钥」输入框粘贴你的 API Key
+   - 点击「测试 GLM 连接」
+   - 在模型列表中勾选你要用的模型（如 `glm-4-plus`、`glm-4-air`、`glm-4-flash`）
+
+3. **本地 vLLM 模型**（可选）：
    - 在「vLLM 服务地址」输入你的 vLLM 地址（默认 http://localhost:8000/v1）
    - 点击「测试连接」
    - 勾选本地模型
@@ -56,7 +61,7 @@ node server.js
 
 - **后端**：Node.js + Express，使用 SSE（Server-Sent Events）实时推送
 - **前端**：原生 JavaScript + CSS Variables 主题系统
-- **API**：支持 OpenAI 兼容格式（vLLM）和 DeepSeek API
+- **API**：支持 OpenAI 兼容格式（vLLM）、DeepSeek API 和 GLM（智谱）API
 - **记录**：Node.js fs 模块写入 Markdown 文件
 
 ## 项目结构
@@ -75,6 +80,7 @@ llm-arena/
 
 ## 环境变量
 
+- `GLM_API_KEY`：GLM（智谱）API 密钥（可选，也可以在页面设置中填写）
 - `DEEPSEEK_API_KEY`：DeepSeek API 密钥（可选，也可以在页面设置中填写）
 - `PORT`：服务端口（默认 3456）
 
