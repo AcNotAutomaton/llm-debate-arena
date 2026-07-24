@@ -239,6 +239,7 @@ async function startDebate(debateId) {
   if (!s) return;
   s.status = 'running';
   s.history = [];
+  s.aborted = false;
   const totalSteps = s.rounds * s.models.length;
   emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps });
   for (let step = 0; step < totalSteps; step++) {
@@ -258,18 +259,25 @@ async function startDebate(debateId) {
     } catch (err) {
       s.history.push({ model: model.name, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
       emit(debateId, 'model-error', { model: model.name, round: turnNum, error: err.message });
+      s.aborted = true;
+      break;
     }
     emit(debateId, 'round-end', { turn: turnNum, totalTurns: totalSteps });
   }
-  s.status = 'completed';
-  try {
-    await evaluateModels(debateId, s);
-  } catch (e) { console.error('Eval failed:', e.message); }
-  try {
-    await runJudge(debateId, s);
-    emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
-  } catch (e) {
-    emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
+  if (s.aborted) {
+    s.status = 'aborted';
+    emit(debateId, 'debate-end', { aborted: true, errorMessage: s.history[s.history.length - 1]?.content || '未知错误' });
+  } else {
+    s.status = 'completed';
+    try {
+      await evaluateModels(debateId, s);
+    } catch (e) { console.error('Eval failed:', e.message); }
+    try {
+      await runJudge(debateId, s);
+      emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
+    } catch (e) {
+      emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
+    }
   }
   try {
     const dir = require('path').join(__dirname, 'debates');
@@ -282,6 +290,7 @@ async function startDebate(debateId) {
       String(now.getMinutes()).padStart(2,'0') + '-' +
       String(now.getSeconds()).padStart(2,'0') + '.md';
     let md = '# LLM \u8fa9\u8bba\u8bb0\u5f55\n\n';
+    if (s.aborted) md += '**状态**: ❌ 辩论因错误中断\n\n';
     md += '**\u95ee\u9898**: ' + s.question + '\n\n';
     md += '**\u53c2\u4e0e\u6a21\u578b**: ' + s.models.map(m => m.name).join(', ') + '\n\n---\n\n';
     for (let i = 0; i < s.history.length; i++) {
