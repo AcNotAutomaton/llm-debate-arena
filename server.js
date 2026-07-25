@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
-const GLM_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4';
+const GLM_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
 
 const app = express();
 app.use(cors());
@@ -34,19 +34,20 @@ function getPhaseName(round, total) {
   return '\u653b\u8fa9\u8fa9\u8bba';
 }
 
-function buildSystemPrompt(modelName, stepNum, totalSteps) {
-  const base = `你是 ${modelName}，一位知识渊博、逻辑清晰的专家。请用中文回答。`;
-  if (stepNum === 1) return `${base}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
-  return `${base}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
+function buildSystemPrompt(currentLabel, stepNum, totalSteps) {
+  const base = `你是一位知识渊博、逻辑清晰的辩论参与者。在这场辩论中，你的发言会以「${currentLabel}」为标识。请用中文回答。`;
+  const uncertainty = `\n\n注意：你的对手可能是人类专家，也可能是另一个 AI 模型——你无法确定对方的真实身份。请不要对对方的身份做任何假设，也不要试图点破对方“是不是 AI”，把注意力放在论点本身，自然地展开讨论。`;
+  if (stepNum === 1) return `${base}${uncertainty}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
+  return `${base}${uncertainty}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
 }
 
-function buildUserPrompt(question, modelName, history) {
+function buildUserPrompt(question, currentLabel, history) {
   if (history.length === 0) return question;
-  let context = `问题：${question}\n\n`;
+  let context = `问题：${question}\n\n以下是辩论至今的发言记录（仅以中立标识展示，你不知道发言者是人还是 AI）：\n\n`;
   for (const entry of history) {
-    context += `---\n**${entry.model}**:\n${entry.content}\n\n`;
+    context += `---\n${entry.label}:\n${entry.content}\n\n`;
   }
-  context += `---\n\n现在轮到 ${modelName} 回答。请基于之前所有回答继续深入分析，提出你的观点。`;
+  context += `---\n\n现在轮到你（${currentLabel}）发言。请基于之前的所有发言继续深入分析，提出你的观点。`;
   return context;
 }
 
@@ -213,14 +214,15 @@ async function evaluateModels(debateId, session) {
   var transcript = "";
   for (var _i = 0; _i < session.history.length; _i++) {
     var _e = session.history[_i];
-    transcript += _e.model + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
+    transcript += _e.label + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
   }
   session.evaluations = [];
   for (var _m = 0; _m < session.models.length; _m++) {
     var model = session.models[_m];
+    var myLabel = session.labels ? session.labels[_m] : model.name;
     var msgs = [
-      { role: "system", content: "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后说出你认为哪个模型表现最好。控制在200字以内。" },
-      { role: "user", content: "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型并指出谁表现最好。" }
+      { role: "system", content: "你刚刚以「" + myLabel + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myLabel + "」）的表现，最后说出你认为哪位发言者表现最好。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。" },
+      { role: "user", content: "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者并指出谁表现最好。" }
     ];
     var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
     try {
@@ -240,21 +242,25 @@ async function startDebate(debateId) {
   s.status = 'running';
   s.history = [];
   s.aborted = false;
+  // 为每个参与方分配一个中立标识（参与者A、参与者B…），避免在 prompt 中泄露真实模型名，制造身份不确定性
+  s.labels = s.models.map(function (_, i) { return '参与者' + String.fromCharCode(65 + i); });
   const totalSteps = s.rounds * s.models.length;
   emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps });
   for (let step = 0; step < totalSteps; step++) {
-    const model = s.models[step % s.models.length];
+    const modelIdx = step % s.models.length;
+    const model = s.models[modelIdx];
+    const currentLabel = s.labels[modelIdx];
     const turnNum = step + 1;
     emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name });
     const msgs = [
-      { role: 'system', content: buildSystemPrompt(model.name, turnNum, totalSteps) },
-      { role: 'user', content: buildUserPrompt(s.question, model.name, s.history) }
+      { role: 'system', content: buildSystemPrompt(currentLabel, turnNum, totalSteps) },
+      { role: 'user', content: buildUserPrompt(s.question, currentLabel, s.history) }
     ];
     emit(debateId, 'model-start', { model: model.name, round: turnNum });
     const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
     try {
       const text = await callModel(callConfig, model.id, msgs, s.temperature, s.maxTokens, debateId, model.name, turnNum);
-      s.history.push({ model: model.name, step: turnNum, content: text });
+      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: text });
       emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text });
     } catch (err) {
       s.history.push({ model: model.name, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
