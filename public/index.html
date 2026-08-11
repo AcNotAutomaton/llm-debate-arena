@@ -59,7 +59,15 @@
         <button class="btn-secondary" id="testGLMBtn">测试 GLM 连接</button>
         <span id="glmStatus"></span>
       </div>
-            <div class="form-group">
+      <div class="form-group">
+        <label>OpenCode API 密钥（https://opencode.ai/zen/go/v1）</label>
+        <input type="text" id="opencodeApiKey" placeholder="opencode-..." value="">
+        <button class="btn-secondary" id="testOpenCodeBtn">测试 OpenCode 连接</button>
+        <button class="btn-secondary" id="batchTestOpenCodeBtn" title="用填好的密钥逐个发最小推理请求，验证每个模型真实可用性">🧪 批量测试所有模型可用性</button>
+        <span id="opencodeStatus"></span>
+        <div id="opencodeBatchResults" class="batch-results"></div>
+      </div>
+      <div class="form-group">
         <label>vLLM 服务地址</label>
         <input type="text" id="vllmUrl" value="http://localhost:8000/v1" placeholder="http://localhost:8000/v1">
         <button class="btn-secondary" id="testConnBtn">测试连接</button>
@@ -69,6 +77,16 @@
       <div class="form-group">
         <label>辩论轮数</label>
         <input type="number" id="roundsInput" value="3" min="2" max="50">
+      </div>
+      <div class="form-group">
+        <label>匿名辩论</label>
+        <div class="toggle-row">
+          <label class="switch">
+            <input type="checkbox" id="anonymousToggle" checked>
+            <span class="slider"></span>
+          </label>
+          <span id="anonymousHint" class="hint-text">开启后模型不知道对手身份（盲辩）</span>
+        </div>
       </div>
       <div class="form-group">
         <label>Temperature</label>

@@ -232,10 +232,57 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
 .provider-badge.vllm { background: var(--btn-secondary-bg); color: var(--text-secondary); }
 .provider-badge.ds { background: #1e3a5f; color: #60a5fa; }
 .provider-badge.glm { background: var(--badge-glm-bg); color: var(--badge-glm-text); }
+.provider-badge.opencode { background: #1a3a2f; color: #34d399; }
+
+.stream-notice {
+  margin: 6px 0; padding: 6px 10px; border-radius: 6px;
+  font-size: 12px; font-style: italic;
+}
+.notice-interrupt {
+  background: rgba(239, 68, 68, 0.12); color: #f87171;
+  border-left: 3px solid #ef4444;
+}
+.notice-truncation {
+  background: rgba(217, 119, 6, 0.12); color: #fbbf24;
+  border-left: 3px solid #d97706;
+}
+
+.batch-results {
+  margin-top: 8px; max-height: 220px; overflow-y: auto;
+  border-radius: 6px; font-size: 12px;
+}
+.batch-results:empty { display: none; }
+.batch-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; border-bottom: 1px solid rgba(128,128,128,0.15);
+}
+.batch-item:last-child { border-bottom: none; }
+.batch-icon { flex-shrink: 0; }
+.batch-name { font-weight: 600; flex-shrink: 0; min-width: 120px; }
+.batch-msg { opacity: 0.8; word-break: break-all; }
+.batch-ok .batch-name { color: #22c55e; }
+.batch-fail .batch-name { color: #ef4444; }
+.batch-fail .batch-msg { color: #f87171; }
+.batch-testing .batch-msg { color: var(--text-secondary, #888); }
 
 .conn-status { font-size: 13px; margin-left: 8px; }
 .conn-success { color: #22c55e; }
 .conn-error { color: #ef4444; }
+
+.toggle-row { display: flex; align-items: center; gap: 10px; }
+.hint-text { font-size: 12px; color: var(--text-secondary, #888); }
+.switch { position: relative; display: inline-block; width: 40px; height: 22px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute; cursor: pointer; inset: 0;
+  background: #ccc; border-radius: 22px; transition: 0.25s;
+}
+.slider::before {
+  content: ""; position: absolute; height: 16px; width: 16px;
+  left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.25s;
+}
+.switch input:checked + .slider { background: #4f46e5; }
+.switch input:checked + .slider::before { transform: translateX(18px); }
 
 @media (max-width: 800px) {
   .arena { grid-template-columns: 1fr; }

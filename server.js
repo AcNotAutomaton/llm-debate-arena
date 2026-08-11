@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 const GLM_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
+const OPENCODE_BASE_URL = 'https://opencode.ai/zen/go/v1';
 
 const app = express();
 app.use(cors());
@@ -34,20 +35,122 @@ function getPhaseName(round, total) {
   return '\u653b\u8fa9\u8fa9\u8bba';
 }
 
-function buildSystemPrompt(currentLabel, stepNum, totalSteps) {
-  const base = `你是一位知识渊博、逻辑清晰的辩论参与者。在这场辩论中，你的发言会以「${currentLabel}」为标识。请用中文回答。`;
-  const uncertainty = `\n\n注意：你的对手可能是人类专家，也可能是另一个 AI 模型——你无法确定对方的真实身份。请不要对对方的身份做任何假设，也不要试图点破对方“是不是 AI”，把注意力放在论点本身，自然地展开讨论。`;
-  if (stepNum === 1) return `${base}${uncertainty}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
-  return `${base}${uncertainty}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
+// 统一流式读取器：处理 SSE 拆包、reasoning/content 分流，
+// 并实现三项健壮性保障：
+//   A) 单 token 间隔超时（默认 120s 无新数据即中止）
+//   B) [DONE] 是否真实接收过；若流结束但未收到 [DONE] 视为异常中断
+//   C) 读取 finish_reason，识别 length/最大 token 截断
+// 返回 { text, finishReason, doneSeen, interrupted, interruptedReason }
+const READSTREAM_TIMEOUT_MS = 120000;
+// fetch 握手阶段超时：上游长时间不返回响应头时中止，避免"一直思考中"卡死整个辩论
+const FETCH_HANDSHAKE_TIMEOUT_MS = 60000;
+
+// 带 handshake 超时的 fetch：若上游在 HANDSHAKE_MS 内未返回响应头则 abort
+async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('handshake-timeout')), timeoutMs || FETCH_HANDSHAKE_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { ...options, signal: ctrl.signal });
+    clearTimeout(timer);
+    return resp;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === 'AbortError') {
+      throw new Error(`请求超时（${Math.round((timeoutMs || FETCH_HANDSHAKE_TIMEOUT_MS)/1000)}s 内未收到响应）`);
+    }
+    throw err;
+  }
+}
+async function readStream(resp, debateId, modelName, round) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let full = '', reasoning = '', buf = '';
+  let doneSeen = false, finishReason = null;
+  let interrupted = false, interruptedReason = '';
+  let lastTokenTs = Date.now();
+  const timeoutMs = READSTREAM_TIMEOUT_MS;
+  async function watchIdle() {
+    while (true) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (doneSeen || interrupted) return;
+      if (Date.now() - lastTokenTs > timeoutMs) {
+        interrupted = true; interruptedReason = `超过 ${Math.round(timeoutMs/1000)}s 无新数据`;
+        try { reader.cancel().catch(() => {}); } catch {}
+        return;
+      }
+    }
+  }
+  const watcher = watchIdle().catch(() => {});
+  while (true) {
+    if (interrupted) break;
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || !t.startsWith('data:')) continue;
+      const j = t.slice(5).trim();
+      if (j === '[DONE]') { doneSeen = true; continue; }
+      try {
+        const c = JSON.parse(j);
+        const choice = c.choices?.[0] || {};
+        const tok = choice.delta?.content || '';
+        const reasonTok = choice.delta?.reasoning_content || '';
+        if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
+        if (tok) { full += tok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+      } catch {}
+    }
+  }
+  await watcher;
+  return {
+    text: full || reasoning,
+    finishReason, doneSeen, interrupted, interruptedReason,
+    truncatedByToken: finishReason === 'length'
+  };
 }
 
-function buildUserPrompt(question, currentLabel, history) {
-  if (history.length === 0) return question;
-  let context = `问题：${question}\n\n以下是辩论至今的发言记录（仅以中立标识展示，你不知道发言者是人还是 AI）：\n\n`;
-  for (const entry of history) {
-    context += `---\n${entry.label}:\n${entry.content}\n\n`;
+// 把 readStream 的诊断结果通过 SSE 反馈给前端，并追加到返回文本末尾作为标记
+function annotateStreamResult(debateId, modelName, round, r) {
+  if (r.interrupted) {
+    emit(debateId, 'model-interrupt', { model: modelName, round, reason: r.interruptedReason });
+    return r.text + `\n\n*[⚠️ 输出中断：${r.interruptedReason}]*`;
   }
-  context += `---\n\n现在轮到你（${currentLabel}）发言。请基于之前的所有发言继续深入分析，提出你的观点。`;
+  if (!r.doneSeen && r.text) {
+    emit(debateId, 'model-interrupt', { model: modelName, round, reason: '流未收到结束标记 [DONE]，可能被服务端提前断开' });
+    return r.text + `\n\n*[⚠️ 输出可能被服务端提前截断（未收到 [DONE]）]*`;
+  }
+  if (r.truncatedByToken) {
+    emit(debateId, 'model-truncation', { model: modelName, round, reason: '已达 max_tokens 上限被截断' });
+    return r.text + `\n\n*[ℹ️ 已达 max_tokens 上限，输出被截断]*`;
+  }
+  return r.text;
+}
+
+function buildSystemPrompt(identifier, stepNum, totalSteps, anonymous) {
+  let base, suffix;
+  if (anonymous) {
+    base = `你是一位知识渊博、逻辑清晰的辩论参与者。在这场辩论中，你的发言会以「${identifier}」为标识。请用中文回答。`;
+    suffix = `\n\n注意：你的对手可能是人类专家，也可能是另一个 AI 模型——你无法确定对方的真实身份。请不要对对方的身份做任何假设，也不要试图点破对方“是不是 AI”，把注意力放在论点本身，自然地展开讨论。`;
+  } else {
+    base = `你是 ${identifier}，一位知识渊博、逻辑清晰的专家。请用中文回答。`;
+    suffix = '';
+  }
+  if (stepNum === 1) return `${base}${suffix}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
+  return `${base}${suffix}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
+}
+
+function buildUserPrompt(question, identifier, history, anonymous) {
+  if (history.length === 0) return question;
+  let context = `问题：${question}\n\n`;
+  if (anonymous) context += `以下是辩论至今的发言记录（仅以中立标识展示，你不知道发言者是人还是 AI）：\n\n`;
+  for (const entry of history) {
+    const who = anonymous ? entry.label : entry.model;
+    context += `---\n${who}:\n${entry.content}\n\n`;
+  }
+  context += `---\n\n现在轮到你（${identifier}）发言。请基于之前的所有发言继续深入分析，提出你的观点。`;
   return context;
 }
 
@@ -55,90 +158,28 @@ async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, deba
   const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`vLLM \u9519\u8bef (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let full = '', buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || !t.startsWith('data:')) continue;
-      const j = t.slice(5).trim();
-      if (j === '[DONE]') continue;
-      try {
-        const c = JSON.parse(j);
-        const tok = c.choices?.[0]?.delta?.content || '';
-        const reasonTok = c.choices?.[0]?.delta?.reasoning_content || '';
-        if (reasonTok) { emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
-        if (tok) { full += tok; emit(debateId, 'model-token', { model: modelName, round, token: tok, type: 'content' }); }
-      } catch {}
-    }
-  }
-  return full;
+  const r = await readStream(resp, debateId, modelName, round);
+  return annotateStreamResult(debateId, modelName, round, r);
 }
 
 async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`DeepSeek 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let full = '', buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || !t.startsWith('data:')) continue;
-      const j = t.slice(5).trim();
-      if (j === '[DONE]') continue;
-      try {
-        const c = JSON.parse(j);
-        const tok = c.choices?.[0]?.delta?.content || '';
-        if (tok) { full += tok; emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
-      } catch {}
-    }
-  }
-  return full;
+  const r = await readStream(resp, debateId, modelName, round);
+  return annotateStreamResult(debateId, modelName, round, r);
 }
 
 async function callGLM(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`GLM 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let full = '', buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || !t.startsWith('data:')) continue;
-      const j = t.slice(5).trim();
-      if (j === '[DONE]') continue;
-      try {
-        const c = JSON.parse(j);
-        const tok = c.choices?.[0]?.delta?.content || '';
-        if (tok) { full += tok; emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
-      } catch {}
-    }
-  }
-  return full;
+  const r = await readStream(resp, debateId, modelName, round);
+  return annotateStreamResult(debateId, modelName, round, r);
 }
 
 function getModelCallConfig(model, vllmBaseUrl) {
@@ -149,6 +190,10 @@ function getModelCallConfig(model, vllmBaseUrl) {
   if (provider === 'glm') {
     return { provider: 'glm', baseUrl: model.baseUrl || GLM_BASE_URL, apiKey: model.apiKey || process.env.GLM_API_KEY || '' };
   }
+  if (provider === 'opencode') {
+    // OpenCode 为 OpenAI 兼容格式，复用 vLLM 调用逻辑
+    return { provider: 'opencode', baseUrl: model.baseUrl || OPENCODE_BASE_URL, apiKey: model.apiKey || '' };
+  }
   return { provider: 'vllm', baseUrl: model.baseUrl || vllmBaseUrl, apiKey: model.apiKey || '' };
 }
 
@@ -158,6 +203,10 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
   }
   if (config.provider === 'glm') {
     return callGLM(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
+  }
+  if (config.provider === 'opencode') {
+    // OpenCode 为 OpenAI 兼容格式，复用 vLLM 流式调用
+    return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
   }
   return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
 }
@@ -211,18 +260,28 @@ async function runJudge(debateId, session) {
 
 async function evaluateModels(debateId, session) {
   emit(debateId, "model-eval-start", {});
+  var anonymous = session.anonymous !== false;
   var transcript = "";
   for (var _i = 0; _i < session.history.length; _i++) {
     var _e = session.history[_i];
-    transcript += _e.label + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
+    var who = anonymous ? _e.label : _e.model;
+    transcript += who + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
   }
   session.evaluations = [];
   for (var _m = 0; _m < session.models.length; _m++) {
     var model = session.models[_m];
-    var myLabel = session.labels ? session.labels[_m] : model.name;
+    var myId = (anonymous && session.labels) ? session.labels[_m] : model.name;
+    var sysContent, userContent;
+    if (anonymous) {
+      sysContent = "你刚刚以「" + myId + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myId + "」）的表现，最后说出你认为哪位发言者表现最好。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。";
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者并指出谁表现最好。";
+    } else {
+      sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后说出你认为哪个模型表现最好。控制在200字以内。";
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型并指出谁表现最好。";
+    }
     var msgs = [
-      { role: "system", content: "你刚刚以「" + myLabel + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myLabel + "」）的表现，最后说出你认为哪位发言者表现最好。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。" },
-      { role: "user", content: "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者并指出谁表现最好。" }
+      { role: "system", content: sysContent },
+      { role: "user", content: userContent }
     ];
     var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
     try {
@@ -242,19 +301,21 @@ async function startDebate(debateId) {
   s.status = 'running';
   s.history = [];
   s.aborted = false;
-  // 为每个参与方分配一个中立标识（参与者A、参与者B…），避免在 prompt 中泄露真实模型名，制造身份不确定性
+  // 为每个参与方分配一个中立标识（参与者A、参与者B…），匿名模式下用其替代真实模型名，避免泄露身份
   s.labels = s.models.map(function (_, i) { return '参与者' + String.fromCharCode(65 + i); });
+  const anonymous = s.anonymous !== false;
   const totalSteps = s.rounds * s.models.length;
-  emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps });
+  emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps, anonymous: anonymous });
   for (let step = 0; step < totalSteps; step++) {
     const modelIdx = step % s.models.length;
     const model = s.models[modelIdx];
     const currentLabel = s.labels[modelIdx];
+    const identifier = anonymous ? currentLabel : model.name;
     const turnNum = step + 1;
     emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name });
     const msgs = [
-      { role: 'system', content: buildSystemPrompt(currentLabel, turnNum, totalSteps) },
-      { role: 'user', content: buildUserPrompt(s.question, currentLabel, s.history) }
+      { role: 'system', content: buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
+      { role: 'user', content: buildUserPrompt(s.question, identifier, s.history, anonymous) }
     ];
     emit(debateId, 'model-start', { model: model.name, round: turnNum });
     const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
@@ -263,7 +324,7 @@ async function startDebate(debateId) {
       s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: text });
       emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text });
     } catch (err) {
-      s.history.push({ model: model.name, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
+      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
       emit(debateId, 'model-error', { model: model.name, round: turnNum, error: err.message });
       s.aborted = true;
       break;
@@ -340,6 +401,18 @@ app.post('/api/test-connection', async (req, res) => {
     } catch (err) { res.json({ success: false, error: err.message }); }
     return;
   }
+  if (prov === 'opencode') {
+    const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/models`;
+    try {
+      const headers = {};
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      const resp = await fetch(url, { headers });
+      const data = await resp.json();
+      if (data.error) { res.json({ success: false, error: data.error.message || JSON.stringify(data.error) }); return; }
+      res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
+    } catch (err) { res.json({ success: false, error: err.message }); }
+    return;
+  }
   try {
     const resp = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`);
     const data = await resp.json();
@@ -347,12 +420,44 @@ app.post('/api/test-connection', async (req, res) => {
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
+// 单模型可用性测试：发一次最小推理调用（非流式），判断模型真正可用与否
+app.post('/api/test-model', async (req, res) => {
+  const { provider, apiKey, baseUrl, modelId } = req.body;
+  const prov = provider || 'vllm';
+  let url, headers = { 'Content-Type': 'application/json' };
+  if (prov === 'deepseek') {
+    url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  } else if (prov === 'glm') {
+    url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  } else if (prov === 'opencode') {
+    url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  } else {
+    url = `${(baseUrl || '').replace(/\/+$/, '')}/chat/completions`;
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+  try {
+    const resp = await fetch(url, {
+      method: 'POST', headers,
+      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5, stream: false })
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      const msg = (data.error && (data.error.message || data.error)) || `HTTP ${resp.status}`;
+      return res.json({ success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
+    }
+    res.json({ success: true, model: modelId, reply: (data.choices?.[0]?.message?.content || '').slice(0, 60) });
+  } catch (err) { res.json({ success: false, error: err.message }); }
+});
+
 app.post('/api/debate', (req, res) => {
-  const { question, models, rounds = 3, vllmBaseUrl = 'http://localhost:8000/v1', temperature = 0.7, maxTokens = 2048, judgeModel, judgeProvider, judgeApiKey, judgeBaseUrl } = req.body;
+  const { question, models, rounds = 3, vllmBaseUrl = 'http://localhost:8000/v1', temperature = 0.7, maxTokens = 2048, anonymous = true, judgeModel, judgeProvider, judgeApiKey, judgeBaseUrl } = req.body;
   if (!question || !models || models.length < 2) return res.status(400).json({ error: '\u9700\u8981\u81f3\u5c112\u4e2a\u6a21\u578b\u53c2\u4e0e\u8fa9\u8bba' });
   const id = crypto.randomUUID();
     const judgeConfig = judgeProvider ? { provider: judgeProvider, baseUrl: judgeBaseUrl || DEEPSEEK_BASE_URL, apiKey: judgeApiKey || '' } : null;
-  sessions.set(id, { id, question, models, rounds, vllmBaseUrl, temperature, maxTokens, judgeModel: judgeModel || models[0].id, judgeConfig, status: 'pending', history: new Map(), judgeResult: null, createdAt: Date.now() });
+  sessions.set(id, { id, question, models, rounds, vllmBaseUrl, temperature, maxTokens, anonymous: anonymous !== false, judgeModel: judgeModel || models[0].id, judgeConfig, status: 'pending', history: new Map(), judgeResult: null, createdAt: Date.now() });
   sseClients.set(id, new Set());
   startDebate(id).catch(e => console.error(e));
   res.json({ debateId: id });
