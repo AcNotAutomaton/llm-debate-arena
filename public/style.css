@@ -247,6 +247,23 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
   border-left: 3px solid #d97706;
 }
 
+/* 模型互评投票 */
+.winres-line {
+  margin: 8px 0 2px; padding: 6px 10px; border-radius: 6px;
+  font-family: ui-monospace, "Consolas", monospace; font-size: 13px;
+  background: rgba(79, 70, 229, 0.14); color: #a5b4fc;
+  border-left: 3px solid #4f46e5;
+}
+.vote-badge {
+  font-size: 11px; padding: 2px 8px; margin-left: 6px; border-radius: 10px;
+  background: rgba(79, 70, 229, 0.2); color: #a5b4fc;
+}
+.vote-tally { margin: 12px 0; padding: 10px 14px; border-radius: 8px; background: rgba(79, 70, 229, 0.08); border: 1px solid rgba(79, 70, 229, 0.25); }
+.vote-tally-title { font-weight: 700; margin-bottom: 6px; }
+.vote-row { display: flex; justify-content: space-between; padding: 4px 0; }
+.vote-cand { font-weight: 600; }
+.vote-count { color: var(--text-secondary, #888); }
+
 .batch-results {
   margin-top: 8px; max-height: 220px; overflow-y: auto;
   border-radius: 6px; font-size: 12px;

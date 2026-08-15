@@ -554,6 +554,13 @@ es.addEventListener("model-start", (e) => {
       }
       msg.textContent = data.evaluation;
       delete msg.dataset.streaming;
+      // 若含投票，追加高亮一行
+      if (data.winRes) {
+        var vr = document.createElement("div");
+        vr.className = "winres-line";
+        vr.textContent = "win_res：" + data.winRes;
+        body.appendChild(vr);
+      }
       body.scrollTop = body.scrollHeight;
     }
   });
@@ -575,10 +582,35 @@ function showResults(data) {
   var evaluations = data.evaluations || [];
   if (judgeText) html += '<div class="judge-text">' + escapeHtml(judgeText) + "</div>";
   if (evaluations && evaluations.length > 0) {
+    // 汇总模型互评投票
+    var votes = {};
+    for (var v = 0; v < evaluations.length; v++) {
+      var wr = evaluations[v].winRes || "";
+      if (wr) votes[wr] = (votes[wr] || 0) + 1;
+    }
+    var voteList = Object.keys(votes);
+    if (voteList.length > 0) {
+      voteList.sort(function (a, b) { return votes[b] - votes[a]; });
+      html += '<div class="vote-tally"><div class="vote-tally-title">🗳️ 模型互评投票汇总</div>';
+      for (var k = 0; k < voteList.length; k++) {
+        var cand = voteList[k];
+        html += '<div class="vote-row"><span class="vote-cand">' + escapeHtml(cand) + '</span><span class="vote-count">' + votes[cand] + ' 票</span></div>';
+      }
+      html += '</div>';
+    }
     html += '<div class="eval-section"><div class="eval-title">🤝 模型互评</div>';
     for (var i = 0; i < evaluations.length; i++) {
       var ev = evaluations[i];
-      html += '<div class="eval-card"><div class="eval-name">' + escapeHtml(ev.model) + '</div><div class="eval-text">' + escapeHtml(ev.evaluation) + '</div></div>';
+      // 把 win_res 行从评价正文里分离出来单独高亮
+      var full = ev.evaluation || '';
+      var winRes = ev.winRes || '';
+      var m = full.match(/win_res[:：][^\n\r]*/i);
+      var body = m ? full.replace(m[0], '').replace(/\n+$/, '') : full;
+      html += '<div class="eval-card"><div class="eval-name">' + escapeHtml(ev.model);
+      if (winRes) html += ' <span class="vote-badge">投：' + escapeHtml(winRes) + '</span>';
+      html += '</div><div class="eval-text">' + escapeHtml(body) + '</div>';
+      if (m) html += '<div class="winres-line">win_res：' + escapeHtml(winRes) + '</div>';
+      html += '</div>';
     }
     html += '</div>';
   }

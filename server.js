@@ -35,15 +35,29 @@ function getPhaseName(round, total) {
   return '\u653b\u8fa9\u8fa9\u8bba';
 }
 
+// 推理模型最低 max_tokens 阈值：推理模型的思考过程会占用大量 tokens，
+// 若用用户设的小值会把思考用光、正文还没生成就被截断。
+// 对推理模型自动放大到该下限，非推理模型仍用用户的设置值。
+const REASONING_MODEL_MIN_TOKENS = 16384;
+// 通过模型名惯例匹配推理模型，无需维护精确名单
+function isReasoningModel(modelId) {
+  const id = (modelId || '').toLowerCase();
+  return /^(glm-5|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|.*-r1|.*-thinking|.*-reasoner|.*-air)/i.test(id)
+      || /thinking|reasoning|reasoner|qwq|o1-|o3-|o4-|-r1$|-air$/i.test(id);
+}
+function effectiveMaxTokens(modelId, userMax) {
+  return isReasoningModel(modelId) ? Math.max(userMax || 0, REASONING_MODEL_MIN_TOKENS) : userMax;
+}
+
 // 统一流式读取器：处理 SSE 拆包、reasoning/content 分流，
 // 并实现三项健壮性保障：
 //   A) 单 token 间隔超时（默认 120s 无新数据即中止）
 //   B) [DONE] 是否真实接收过；若流结束但未收到 [DONE] 视为异常中断
 //   C) 读取 finish_reason，识别 length/最大 token 截断
 // 返回 { text, finishReason, doneSeen, interrupted, interruptedReason }
-const READSTREAM_TIMEOUT_MS = 120000;
+const READSTREAM_TIMEOUT_MS = 600000;
 // fetch 握手阶段超时：上游长时间不返回响应头时中止，避免"一直思考中"卡死整个辩论
-const FETCH_HANDSHAKE_TIMEOUT_MS = 60000;
+const FETCH_HANDSHAKE_TIMEOUT_MS = 300000;
 
 // 带 handshake 超时的 fetch：若上游在 HANDSHAKE_MS 内未返回响应头则 abort
 async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
@@ -268,16 +282,21 @@ async function evaluateModels(debateId, session) {
     transcript += who + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
   }
   session.evaluations = [];
+  // 候选标识列表：匿名用「参与者X」，实名用真实模型名
+  var candidates = anonymous && session.labels ? session.labels.slice() : session.models.map(function (m) { return m.name; });
   for (var _m = 0; _m < session.models.length; _m++) {
     var model = session.models[_m];
     var myId = (anonymous && session.labels) ? session.labels[_m] : model.name;
+    // 候选名单（去掉自己）
+    var opponents = candidates.filter(function (c) { return c !== myId; });
     var sysContent, userContent;
+    var fmtRule = "\n\n格式要求：评价结束后，必须在最后一行给出最终投票，格式严格为「win_res：胜者标识」。胜者标识只能从以下候选中选一个：" + candidates.join("、") + "。例如：win_res：" + (opponents[0] || myId) + "。这一行必须完整且独立成行，不得缺省。";
     if (anonymous) {
-      sysContent = "你刚刚以「" + myId + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myId + "」）的表现，最后说出你认为哪位发言者表现最好。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。";
-      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者并指出谁表现最好。";
+      sysContent = "你刚刚以「" + myId + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myId + "」）的表现，最后投票评出胜者。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。" + fmtRule;
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者，并在最后一行用「win_res：胜者标识」投票评出胜者。";
     } else {
-      sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后说出你认为哪个模型表现最好。控制在200字以内。";
-      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型并指出谁表现最好。";
+      sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后投票评出胜者。控制在200字以内。" + fmtRule;
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型，并在最后一行用「win_res：胜者标识」投票评出胜者。";
     }
     var msgs = [
       { role: "system", content: sysContent },
@@ -286,11 +305,16 @@ async function evaluateModels(debateId, session) {
     var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
     try {
       var text = await callModel(callConfig, model.id, msgs, 0.3, 512, debateId, model.name, "eval");
-      session.evaluations.push({ model: model.name, evaluation: text });
-      emit(debateId, "model-evaluation", { model: model.name, evaluation: text });
+      // 解析最后一行 win_res：xxx
+      var mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
+      var winRes = mWin ? mWin[1].trim() : "";
+      // 校验：winRes 必须是候选之一，否则置空
+      if (winRes && candidates.indexOf(winRes) < 0) winRes = "";
+      session.evaluations.push({ model: model.name, evaluation: text, winRes: winRes });
+      emit(debateId, "model-evaluation", { model: model.name, evaluation: text, winRes: winRes });
     } catch (err) {
-      session.evaluations.push({ model: model.name, evaluation: "评价失败: " + err.message });
-      emit(debateId, "model-evaluation", { model: model.name, evaluation: "评价失败: " + err.message });
+      session.evaluations.push({ model: model.name, evaluation: "评价失败: " + err.message, winRes: "" });
+      emit(debateId, "model-evaluation", { model: model.name, evaluation: "评价失败: " + err.message, winRes: "" });
     }
   }
 }
@@ -319,8 +343,10 @@ async function startDebate(debateId) {
     ];
     emit(debateId, 'model-start', { model: model.name, round: turnNum });
     const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
+    // 推理模型自动放大 max_tokens（思考过程需要），非推理模型沿用用户的设置值
+    const effMax = effectiveMaxTokens(model.id, s.maxTokens);
     try {
-      const text = await callModel(callConfig, model.id, msgs, s.temperature, s.maxTokens, debateId, model.name, turnNum);
+      const text = await callModel(callConfig, model.id, msgs, s.temperature, effMax, debateId, model.name, turnNum);
       s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: text });
       emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text });
     } catch (err) {
