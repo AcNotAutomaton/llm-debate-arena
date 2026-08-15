@@ -240,7 +240,9 @@ async function runJudge(debateId, session) {
   try {
     const judgeModelId = session.judgeModel || session.models[0].id;
     const judgeConfig = session.judgeConfig || getModelCallConfig(session.models[0], session.vllmBaseUrl);
-    const text = await callModel(judgeConfig, judgeModelId, msgs, 0.3, 2048, debateId, '裁判', session.rounds + 1);
+    // 裁判若是推理模型，思考过程同样会吃光预算，沿用自动放大逻辑
+    const judgeEffMax = effectiveMaxTokens(judgeModelId, 2048);
+    const text = await callModel(judgeConfig, judgeModelId, msgs, 0.3, judgeEffMax, debateId, '裁判', session.rounds + 1);
     const scores = {};
     let winner = '';
     for (const line of text.split('\n')) {
@@ -303,8 +305,10 @@ async function evaluateModels(debateId, session) {
       { role: "user", content: userContent }
     ];
     var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
+    // 互评阶段也需要对推理模型放大 max_tokens——思考过程同样会吃光预算
+    var effMax = effectiveMaxTokens(model.id, 512);
     try {
-      var text = await callModel(callConfig, model.id, msgs, 0.3, 512, debateId, model.name, "eval");
+      var text = await callModel(callConfig, model.id, msgs, 0.3, effMax, debateId, model.name, "eval");
       // 解析最后一行 win_res：xxx
       var mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
       var winRes = mWin ? mWin[1].trim() : "";
