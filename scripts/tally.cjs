@@ -69,6 +69,18 @@ function analyzeFile(file) {
   const votes = {}; // 胜者 => 票数
   const modelVotes = {}; // 互评者 => 其投的胜者
   let hasAnyWinRes = false;
+  let usedAnonTag = false; // 匿名场（投票值是「参与者X」这种中立标识）
+
+  // 匿名场把「参与者A/B/C…」按参与模型列表顺序映射回真实模型名
+  // （文件头「参与模型: 模型1, 模型2」的顺序即字母序：A->0, B->1, …）
+  const mapName = (raw) => {
+    const mm = /^参与者([A-Z])$/.exec(raw);
+    if (mm && participants.length) {
+      const idx = mm[1].charCodeAt(0) - 65;
+      if (idx >= 0 && idx < participants.length) return participants[idx];
+    }
+    return raw;
+  };
 
   for (let i = 1; i + 1 < parts.length; i += 2) {
     const who = parts[i].trim();
@@ -76,7 +88,9 @@ function analyzeFile(file) {
     const m = txt.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
     if (m) {
       hasAnyWinRes = true;
-      const win = m[1].trim();
+      const rawWin = m[1].trim();
+      if (/^参与者[A-Z]$/.test(rawWin)) usedAnonTag = true;
+      const win = mapName(rawWin);
       votes[win] = (votes[win] || 0) + 1;
       modelVotes[who] = win;
     } else {
@@ -93,7 +107,11 @@ function analyzeFile(file) {
   else if (sorted[0].n > sorted[1].n) result = sorted[0].name + ' 胜';
   else result = '平局';
 
-  return { file: path.basename(file), participants, votes, modelVotes, result, sorted };
+  // 匿名场用于在明细里标注「A=真身 / B=真身」的对照
+  const anonMapping = usedAnonTag && participants.length
+    ? participants.map((p, i) => String.fromCharCode(65 + i) + '=' + p).join('/')
+    : '';
+  return { file: path.basename(file), participants, votes, modelVotes, result, sorted, anonymous: usedAnonTag, anonMapping };
 }
 
 // 分析所有文件
@@ -152,6 +170,17 @@ if (stats.length === 0) {
   process.exit(0);
 }
 
+// 匿名场对照表：凡是出现「参与者X」投票的场次，统一在顶部列出 A/B/... = 真身
+const anonMatches = stats.filter(s => s.anonymous && s.anonMapping);
+const anonSet = {};
+for (const s of anonMatches) anonSet[s.anonMapping] = true;
+const anonLines = Object.keys(anonSet);
+if (anonLines.length > 0) {
+  console.log('【匿名场真身对照】');
+  for (const line of anonLines) console.log('  参与者 ' + line);
+  console.log('');
+}
+
 if (totalVoteCount > 0) {
   console.log('【参与模型得票总数】');
   const maxN = totalSorted.length > 0 ? totalSorted[0].n : 1;
@@ -165,7 +194,9 @@ if (totalVoteCount > 0) {
 console.log('【按场次明细】');
 for (const s of stats) {
   const parts = s.sorted.map(t => t.name + '(' + t.n + ')').join(' vs ');
-  console.log('  ' + s.file + '  ' + parts + '  → ' + s.result);
+  // 匿名场附带真身对照，让「参与者A vs 参与者B」一眼可读
+  const tag = s.anonMapping ? '  [' + s.anonMapping + ']' : '';
+  console.log('  ' + s.file + '  ' + parts + '  → ' + s.result + tag);
 }
 console.log('');
 

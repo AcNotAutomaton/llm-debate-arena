@@ -42,7 +42,8 @@ const REASONING_MODEL_MIN_TOKENS = 16384;
 // 通过模型名惯例匹配推理模型，无需维护精确名单
 function isReasoningModel(modelId) {
   const id = (modelId || '').toLowerCase();
-  return /^(glm-5|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|.*-r1|.*-thinking|.*-reasoner|.*-air)/i.test(id)
+  // glm-4.6 及以上版本（4.6/4.7/4.8/4.9）均带推理能力，4.5 及以下不带
+  return /^(glm-5|glm-4\.[6-9]|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|.*-r1|.*-thinking|.*-reasoner|.*-air|minimax-m)/i.test(id)
       || /thinking|reasoning|reasoner|qwq|o1-|o3-|o4-|-r1$|-air$/i.test(id);
 }
 function effectiveMaxTokens(modelId, userMax) {
@@ -95,8 +96,9 @@ async function readStream(resp, debateId, modelName, round) {
     }
   }
   const watcher = watchIdle().catch(() => {});
+  let streamFinished = false; // 上游已通过 finish_reason 声明生成完毕
   while (true) {
-    if (interrupted) break;
+    if (interrupted || streamFinished) break;
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
@@ -106,7 +108,7 @@ async function readStream(resp, debateId, modelName, round) {
       const t = line.trim();
       if (!t || !t.startsWith('data:')) continue;
       const j = t.slice(5).trim();
-      if (j === '[DONE]') { doneSeen = true; continue; }
+      if (j === '[DONE]') { doneSeen = true; streamFinished = true; break; }
       try {
         const c = JSON.parse(j);
         const choice = c.choices?.[0] || {};
@@ -114,13 +116,44 @@ async function readStream(resp, debateId, modelName, round) {
         const reasonTok = choice.delta?.reasoning_content || '';
         if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
         if (tok) { full += tok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
-        if (choice.finish_reason) finishReason = choice.finish_reason;
+        // 收到 finish_reason 即视为上游生成完毕：某些 provider（如 OpenCode 转发的 minimax）
+        // 发完 finish_reason 后既不发送 [DONE] 也不关闭连接，单纯靠 idle 超时会白白多等 10 分钟。
+        // 此处据此主动结束读取，避免无意义挂起。
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+          doneSeen = true;
+          streamFinished = true;
+          break;
+        }
       } catch {}
     }
   }
+  if (streamFinished) { try { reader.cancel().catch(() => {}); } catch {} }
   await watcher;
+  // 兜底：剥离模型把思考过程泄漏到 content（而非 reasoning_content）的情况。
+  // 三种已知形态：
+  //   1) <think>...</think> 标签包裹（minimax-m3 等），含被 max_tokens 截断的孤立 <think> 起始标签
+  //   2) 以「1. **分析请求**」「1. **分析辩论**」等元指令开头的编号思考（glm-4.7）
+  //      ——真实辩论正文里模型也会用编号列表展开论点，但不会写「分析请求/分析辩论/确定胜者」
+  //         这种对自身任务的元描述，因此按这些元指令截断是安全的。
+  //   3) 英文思考引子「Now I need to write...」「Let me analyze/draft...」（GLM5、minimax 等英文思考链）
+  // 提示词已明令禁止，但仍兜底——保证返回的 text 不含思考过程。
+  let cleaned = full;
+  // 形态 1：闭合的 <think>...</think>
+  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  // 形态 1 续：孤立的未闭合 <think> 起始标签（截断时常见），从该标签起整段丢弃
+  const openIdx = cleaned.search(/<think>/i);
+  if (openIdx >= 0) cleaned = cleaned.substring(0, openIdx);
+  // 形态 2：以「1. **分析请求/分析辩论/分析任务/确定胜者**」等元指令开头的编号思考
+  //         从首个元指令行起整段丢弃，只保留其前可能的少量导语（通常没有）
+  const metaIdx = cleaned.search(/^\s*\d+\.\s*\*{0,2}\s*(分析请求|分析辩论|分析任务|分析辩论内容|确定胜者|评价表现|分析表现)/mi);
+  if (metaIdx >= 0) cleaned = cleaned.substring(0, metaIdx);
+  // 形态 3：英文思考引子开头的段落（出现在文末或文首）
+  const engIdx = cleaned.search(/^(Now I need to write|Let me (analyze|draft|write|consider|think|structure|carefully)|Let's analyze|Let me see)/mi);
+  if (engIdx >= 0) cleaned = cleaned.substring(0, engIdx);
+  cleaned = cleaned.trim();
   return {
-    text: full || reasoning,
+    text: cleaned || reasoning,
     finishReason, doneSeen, interrupted, interruptedReason,
     truncatedByToken: finishReason === 'length'
   };
@@ -294,11 +327,11 @@ async function evaluateModels(debateId, session) {
     var sysContent, userContent;
     var fmtRule = "\n\n格式要求：评价结束后，必须在最后一行给出最终投票，格式严格为「win_res：胜者标识」。胜者标识只能从以下候选中选一个：" + candidates.join("、") + "。例如：win_res：" + (opponents[0] || myId) + "。这一行必须完整且独立成行，不得缺省。";
     if (anonymous) {
-      sysContent = "你刚刚以「" + myId + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myId + "」）的表现，最后投票评出胜者。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。" + fmtRule;
-      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请评价每位发言者，并在最后一行用「win_res：胜者标识」投票评出胜者。";
+      sysContent = "你刚刚以「" + myId + "」的身份参加了一场辩论，对手可能是人类专家，也可能是另一个 AI 模型，你无法确定对方的真实身份。请基于辩论记录，用中文简短评价每位发言者（包括你自己「" + myId + "」）的表现，最后投票评出胜者。请始终使用「参与者X」这样的中立标识，不要猜测或编造对方的真实身份。控制在200字以内。\n\n重要要求：\n1. 不要输出思考过程、内部独白或任何 <think> 标签内容——直接给出最终评价。\n2. 不要逐条复述辩论内容，直接给出你的评价结论。\n3. 必须确保最后能输出「win_res：胜者标识」这一行，这是最关键的。" + fmtRule;
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录（仅以中立标识展示）：\n" + transcript + "\n\n请直接给出每位发言者的评价结论（不要思考过程、不要复述辩论），并在最后一行用「win_res：胜者标识」投票评出胜者。";
     } else {
-      sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后投票评出胜者。控制在200字以内。" + fmtRule;
-      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请评价每个模型，并在最后一行用「win_res：胜者标识」投票评出胜者。";
+      sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后投票评出胜者。控制在200字以内。\n\n重要要求：\n1. 不要输出思考过程、内部独白或任何 <think> 标签内容——直接给出最终评价。\n2. 不要逐条复述辩论内容，直接给出你的评价结论。\n3. 必须确保最后能输出「win_res：胜者标识」这一行，这是最关键的。" + fmtRule;
+      userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请直接给出每个模型的评价结论（不要思考过程、不要复述辩论），并在最后一行用「win_res：胜者标识」投票评出胜者。";
     }
     var msgs = [
       { role: "system", content: sysContent },
@@ -307,10 +340,22 @@ async function evaluateModels(debateId, session) {
     var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
     // 互评阶段也需要对推理模型放大 max_tokens——思考过程同样会吃光预算
     var effMax = effectiveMaxTokens(model.id, 512);
+    var retryDone = false;
     try {
       var text = await callModel(callConfig, model.id, msgs, 0.3, effMax, debateId, model.name, "eval");
-      // 解析最后一行 win_res：xxx
+      // 兜底重试：若返回为空（思考泄漏被全部剥光）或没抠到 win_res，
+      // 用更短更强制的提示再要一次。这种情况常见于推理模型把预算花在思考、
+      // 或把思考伪装成正文写到 content 被 readStream 清理掉后剩空。
       var mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
+      if ((!text || !mWin) && !retryDone) {
+        retryDone = true;
+        var retrySys = "只做一件事：直接输出最终投票，不要任何思考、分析、编号列表或  标签。控制在 80 字以内，最后一行严格为「win_res：胜者标识」。胜者标识只能从这些候选中选一个：" + candidates.join("、") + "。";
+        var retryUser = "辩论问题：" + session.question + "\n\n辩论记录（简版，仅标识）：\n" + transcript + "\n\n直接给出最终投票，最后一行必须是「win_res：胜者标识」。";
+        var retryMsgs = [ { role: "system", content: retrySys }, { role: "user", content: retryUser } ];
+        var retryText = await callModel(callConfig, model.id, retryMsgs, 0.3, effMax, debateId, model.name, "eval-retry");
+        if (retryText) text = retryText;
+        mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
+      }
       var winRes = mWin ? mWin[1].trim() : "";
       // 校验：winRes 必须是候选之一，否则置空
       if (winRes && candidates.indexOf(winRes) < 0) winRes = "";
