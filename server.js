@@ -101,9 +101,19 @@ async function readStream(resp, debateId, modelName, round) {
   }
   const watcher = watchIdle().catch(() => {});
   let streamFinished = false; // 上游已通过 finish_reason 声明生成完毕
+  let streamError = null; // 连接异常（如 terminated）
   while (true) {
     if (interrupted || streamFinished) break;
-    const { done, value } = await reader.read();
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (readErr) {
+      // 连接被远端意外关闭（Node undici 抛 TypeError: terminated），
+      // 不让整场辩论废掉——保留已收到的内容，标记为中断
+      streamError = readErr;
+      break;
+    }
+    const { done, value } = chunk;
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     const lines = buf.split('\n');
@@ -219,7 +229,27 @@ async function readStream(resp, debateId, modelName, round) {
       cleaned = '';
     }
   }
+  // 形态 4：中文思考泄漏——模型用中文自言自语分析任务（如"我需要以 glm-5 的身份
+  //   继续这场技术辩论""对方刚问了...""保持这个姿态"等），这是对自身策略的元描述，
+  //   不会出现在真实辩论正文里。找首个「参与者X：」开头的行作为正文起点。
+  const cnThinkIdx = cleaned.search(/^(我需要以|我需要先|让我来|我来分析|首先我需要|我以.{0,10}身份)/mi);
+  if (cnThinkIdx >= 0) {
+    // 在中文思考起点之后找「参与者X：」行（正文标志）
+    const afterCnThink = cleaned.substring(cnThinkIdx);
+    const bodyMatchCn = afterCnThink.match(/\n(参与者[A-Z][\s：])/);
+    if (bodyMatchCn && bodyMatchCn.index >= 0) {
+      cleaned = afterCnThink.substring(bodyMatchCn.index + 1);
+    } else {
+      // 没有正文行，整段都是中文思考 → 丢弃
+      cleaned = '';
+    }
+  }
   cleaned = cleaned.trim();
+  // 连接被远端意外关闭：把已收到的内容返回（可能为空），标记中断原因
+  if (streamError && !interrupted) {
+    interrupted = true;
+    interruptedReason = '连接被服务端中断（' + (streamError.message || 'terminated') + '）';
+  }
   return {
     text: cleaned || reasoning,
     finishReason, doneSeen, interrupted, interruptedReason,
