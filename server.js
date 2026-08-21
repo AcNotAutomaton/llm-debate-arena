@@ -83,6 +83,10 @@ async function readStream(resp, debateId, modelName, round) {
   let doneSeen = false, finishReason = null;
   let interrupted = false, interruptedReason = '';
   let lastTokenTs = Date.now();
+  // 英文思考泄漏实时检测状态
+  let thinkLeakChecked = false; // 是否已完成开头判定
+  let thinkLeakDetected = false; // 开头判定为英文思考，正在静默累积
+  let thinkLeakBuf = ''; // 检测到中文正文后的过渡缓冲
   const timeoutMs = READSTREAM_TIMEOUT_MS;
   async function watchIdle() {
     while (true) {
@@ -115,7 +119,44 @@ async function readStream(resp, debateId, modelName, round) {
         const tok = choice.delta?.content || '';
         const reasonTok = choice.delta?.reasoning_content || '';
         if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
-        if (tok) { full += tok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: tok }); }
+        if (tok) {
+          full += tok;
+          lastTokenTs = Date.now();
+          // 实时过滤英文思考泄漏：推理模型（如 glm-5）可能把 "Let me analyze..."
+          // 等英文思考链写到 content 字段，长达数万字。若 full 开头匹配英文思考引子，
+          // 暂不推给前端，直到检测到中文正文才开始流式推送。
+          if (!thinkLeakChecked) {
+            // 累积前 80 个字符后再判断，避免短 token 误判
+            if (full.length < 80) { /* 继续累积，不推也不判定 */ }
+            else {
+              thinkLeakChecked = true;
+              if (/^(Let me |Let's |Now I need to |Let me analyze|Let me understand|Let me consider|Let me think|Let me draft|Let me write|Let me see|I need to |First, let me|Okay, let me|Alright, let me)/i.test(full.trimStart())) {
+                thinkLeakDetected = true;
+                // 不推这段给前端，继续静默累积
+              } else {
+                // 不是思考泄漏，把之前累积的 full 一次性补推给前端
+                emit(debateId, 'model-token', { model: modelName, round, token: full });
+              }
+            }
+          } else if (!thinkLeakDetected) {
+            emit(debateId, 'model-token', { model: modelName, round, token: tok });
+          } else {
+            // thinkLeakDetected=true：仍在英文思考阶段，继续静默累积
+            // 检测是否已切换到中文正文（连续出现中文字符）
+            if (/[\u4e00-\u9fff]/.test(tok) && thinkLeakBuf === '') {
+              // 首次检测到中文，标记正文开始；但先缓冲这段过渡内容
+              thinkLeakBuf = tok;
+            } else if (thinkLeakBuf) {
+              thinkLeakBuf += tok;
+              // 缓冲超过 20 字确认是正文而非偶发中文字符
+              if (thinkLeakBuf.length > 20) {
+                emit(debateId, 'model-token', { model: modelName, round, token: thinkLeakBuf });
+                thinkLeakBuf = '';
+                thinkLeakDetected = false; // 切回正常推送模式
+              }
+            }
+          }
+        }
         // 收到 finish_reason 即视为上游生成完毕：某些 provider（如 OpenCode 转发的 minimax）
         // 发完 finish_reason 后既不发送 [DONE] 也不关闭连接，单纯靠 idle 超时会白白多等 10 分钟。
         // 此处据此主动结束读取，避免无意义挂起。
@@ -132,25 +173,52 @@ async function readStream(resp, debateId, modelName, round) {
   await watcher;
   // 兜底：剥离模型把思考过程泄漏到 content（而非 reasoning_content）的情况。
   // 三种已知形态：
-  //   1) <think>...</think> 标签包裹（minimax-m3 等），含被 max_tokens 截断的孤立 <think> 起始标签
+  //   1) <think>...</think> 标签包裹（minimax-m3 等），含被 max_tokens 截断的孤立  起始标签
   //   2) 以「1. **分析请求**」「1. **分析辩论**」等元指令开头的编号思考（glm-4.7）
   //      ——真实辩论正文里模型也会用编号列表展开论点，但不会写「分析请求/分析辩论/确定胜者」
   //         这种对自身任务的元描述，因此按这些元指令截断是安全的。
-  //   3) 英文思考引子「Now I need to write...」「Let me analyze/draft...」（GLM5、minimax 等英文思考链）
+  //   3) 英文思考引子（GLM5、minimax 等英文思考链）——可能是整段英文思考（正文未生成就截断），
+  //      也可能是先写英文思考再切换到中文正文。后者需保留中文正文部分。
   // 提示词已明令禁止，但仍兜底——保证返回的 text 不含思考过程。
   let cleaned = full;
   // 形态 1：闭合的 <think>...</think>
-  cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  cleaned = cleaned.replace(/\u003cthink\u003e[\s\S]*?\u003c\/think\u003e/gi, '');
   // 形态 1 续：孤立的未闭合 <think> 起始标签（截断时常见），从该标签起整段丢弃
-  const openIdx = cleaned.search(/<think>/i);
+  const openIdx = cleaned.search(/\u003cthink\u003e/i);
   if (openIdx >= 0) cleaned = cleaned.substring(0, openIdx);
   // 形态 2：以「1. **分析请求/分析辩论/分析任务/确定胜者**」等元指令开头的编号思考
-  //         从首个元指令行起整段丢弃，只保留其前可能的少量导语（通常没有）
+  //         模型可能写多段编号思考再写正文。简单可靠的规则：
+  //         在元指令起点之后搜索首个「以参与者/我/综合/win_res开头的行」作为正文起点；
+  //         找不到则整段丢弃。
   const metaIdx = cleaned.search(/^\s*\d+\.\s*\*{0,2}\s*(分析请求|分析辩论|分析任务|分析辩论内容|确定胜者|评价表现|分析表现)/mi);
-  if (metaIdx >= 0) cleaned = cleaned.substring(0, metaIdx);
-  // 形态 3：英文思考引子开头的段落（出现在文末或文首）
-  const engIdx = cleaned.search(/^(Now I need to write|Let me (analyze|draft|write|consider|think|structure|carefully)|Let's analyze|Let me see)/mi);
-  if (engIdx >= 0) cleaned = cleaned.substring(0, engIdx);
+  if (metaIdx >= 0) {
+    const afterMeta = cleaned.substring(metaIdx);
+    // 找首个「参与者X」开头的行或「我认为」「综合」「win_res」等正文标志行
+    const bodyMatch = afterMeta.match(/\n(参与者[A-Z]|我认为|综合[：:]|本场|win_res[:：])/);
+    if (bodyMatch && bodyMatch.index >= 0) {
+      cleaned = afterMeta.substring(bodyMatch.index + 1); // +1 跳过换行
+    } else {
+      cleaned = cleaned.substring(0, metaIdx);
+    }
+  }
+  // 形态 3：英文思考引子。两种子情况：
+  //   a) 文首英文思考 + 后续中文正文 → 保留中文正文（找首个中文字符位置作为正文起点）
+  //   b) 整段都是英文思考（被 max_tokens 截断、正文未生成）→ 返回空，上层重试
+  const engStartIdx = cleaned.search(/^(Let me |Let's |Now I need to |I need to |First, let me|Okay, let me|Alright, let me)/mi);
+  if (engStartIdx >= 0) {
+    // 在英文思考起点之后找首个中文字符（正文开始的标志）
+    const afterEng = cleaned.substring(engStartIdx);
+    const cnIdx = afterEng.search(/[\u4e00-\u9fff]/);
+    if (cnIdx >= 0) {
+      // 有中文正文，从该位置往前回溯到行首（避免截断半个句子）
+      let bodyStart = engStartIdx + cnIdx;
+      while (bodyStart > engStartIdx && cleaned[bodyStart - 1] !== '\n') bodyStart--;
+      cleaned = cleaned.substring(bodyStart);
+    } else {
+      // 整段都是英文思考，没有中文正文 → 丢弃全部
+      cleaned = '';
+    }
+  }
   cleaned = cleaned.trim();
   return {
     text: cleaned || reasoning,
@@ -180,13 +248,17 @@ function buildSystemPrompt(identifier, stepNum, totalSteps, anonymous) {
   let base, suffix;
   if (anonymous) {
     base = `你是一位知识渊博、逻辑清晰的辩论参与者。在这场辩论中，你的发言会以「${identifier}」为标识。请用中文回答。`;
-    suffix = `\n\n注意：你的对手可能是人类专家，也可能是另一个 AI 模型——你无法确定对方的真实身份。请不要对对方的身份做任何假设，也不要试图点破对方“是不是 AI”，把注意力放在论点本身，自然地展开讨论。`;
+    suffix = `\n\n注意：你的对手可能是人类专家，也可能是另一个 AI 模型——你无法确定对方的真实身份。请不要对对方的身份做任何假设，也不要试图点破对方”是不是 AI”，把注意力放在论点本身，自然地展开讨论。`;
   } else {
     base = `你是 ${identifier}，一位知识渊博、逻辑清晰的专家。请用中文回答。`;
     suffix = '';
   }
-  if (stepNum === 1) return `${base}${suffix}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
-  return `${base}${suffix}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
+  // 禁止思考过程泄漏到正文：推理模型（如 glm-5）有时会把英文思考链
+  // （”Let me analyze...” “Let me draft...”）写到 content 字段而非 reasoning_content，
+  // 导致数万字思考占用 max_tokens、正文一行未写就被截断。
+  var noThink = `\n\n重要：直接输出你的辩论发言正文。不要输出任何思考过程、内部独白、分析步骤或英文草稿（如”Let me analyze...”、”Let me draft...”、”Now I need to write...”等）。不要使用  标签。你的回复内容会直接作为辩论发言展示给观众，请像在公开论坛上发表观点一样直接书写。`;
+  if (stepNum === 1) return `${base}${suffix}${noThink}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
+  return `${base}${suffix}${noThink}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
 }
 
 function buildUserPrompt(question, identifier, history, anonymous) {
