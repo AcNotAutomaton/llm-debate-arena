@@ -76,7 +76,7 @@ async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
     throw err;
   }
 }
-async function readStream(resp, debateId, modelName, round) {
+async function readStream(resp, debateId, modelName, round, isAnthropic) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let full = '', reasoning = '', buf = '';
@@ -87,6 +87,7 @@ async function readStream(resp, debateId, modelName, round) {
   let thinkLeakChecked = false; // 是否已完成开头判定
   let thinkLeakDetected = false; // 开头判定为英文思考，正在静默累积
   let thinkLeakBuf = ''; // 检测到中文正文后的过渡缓冲
+  let currentEventType = ''; // Anthropic SSE 的 event 类型
   const timeoutMs = READSTREAM_TIMEOUT_MS;
   async function watchIdle() {
     while (true) {
@@ -108,8 +109,6 @@ async function readStream(resp, debateId, modelName, round) {
     try {
       chunk = await reader.read();
     } catch (readErr) {
-      // 连接被远端意外关闭（Node undici 抛 TypeError: terminated），
-      // 不让整场辩论废掉——保留已收到的内容，标记为中断
       streamError = readErr;
       break;
     }
@@ -120,63 +119,71 @@ async function readStream(resp, debateId, modelName, round) {
     buf = lines.pop() || '';
     for (const line of lines) {
       const t = line.trim();
-      if (!t || !t.startsWith('data:')) continue;
-      const j = t.slice(5).trim();
-      if (j === '[DONE]') { doneSeen = true; streamFinished = true; break; }
-      try {
-        const c = JSON.parse(j);
-        const choice = c.choices?.[0] || {};
-        const tok = choice.delta?.content || '';
-        const reasonTok = choice.delta?.reasoning_content || '';
-        if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
-        if (tok) {
+      // —— 协议分支：各自提取 tok / reasonTok，后续共享 think-leak 检测与推送 ——
+      let tok = '', reasonTok = '';
+      if (isAnthropic) {
+        // Anthropic SSE: event: 行 + data: 行交替
+        if (t.startsWith('event:')) { currentEventType = t.slice(6).trim(); continue; }
+        if (!t || !t.startsWith('data:')) continue;
+        const j = t.slice(5).trim();
+        try {
+          const c = JSON.parse(j);
+          if (c.type === 'content_block_delta' && c.delta) {
+            if (c.delta.type === 'text_delta') tok = c.delta.text || '';
+            else if (c.delta.type === 'thinking_delta') reasonTok = c.delta.thinking || '';
+          } else if (c.type === 'message_delta' && c.delta?.stop_reason) {
+            finishReason = c.delta.stop_reason;
+          } else if (c.type === 'message_stop') {
+            doneSeen = true; streamFinished = true; break;
+          }
+        } catch {}
+      } else {
+        // OpenAI 兼容 SSE
+        if (!t || !t.startsWith('data:')) continue;
+        const j = t.slice(5).trim();
+        if (j === '[DONE]') { doneSeen = true; streamFinished = true; break; }
+        try {
+          const c = JSON.parse(j);
+          const choice = c.choices?.[0] || {};
+          tok = choice.delta?.content || '';
+          reasonTok = choice.delta?.reasoning_content || '';
+          if (choice.finish_reason) {
+            finishReason = choice.finish_reason;
+            doneSeen = true; streamFinished = true; break;
+          }
+        } catch {}
+      }
+      // —— 共享：reasoning token 处理 ——
+      if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
+      // —— 共享：content token 处理 + think-leak 实时检测 ——
+      if (tok) {
           full += tok;
           lastTokenTs = Date.now();
-          // 实时过滤英文思考泄漏：推理模型（如 glm-5）可能把 "Let me analyze..."
-          // 等英文思考链写到 content 字段，长达数万字。若 full 开头匹配英文思考引子，
-          // 暂不推给前端，直到检测到中文正文才开始流式推送。
           if (!thinkLeakChecked) {
-            // 累积前 80 个字符后再判断，避免短 token 误判
             if (full.length < 80) { /* 继续累积，不推也不判定 */ }
             else {
               thinkLeakChecked = true;
               if (/^(Let me |Let's |Now I need to |Let me analyze|Let me understand|Let me consider|Let me think|Let me draft|Let me write|Let me see|I need to |First, let me|Okay, let me|Alright, let me)/i.test(full.trimStart())) {
                 thinkLeakDetected = true;
-                // 不推这段给前端，继续静默累积
               } else {
-                // 不是思考泄漏，把之前累积的 full 一次性补推给前端
                 emit(debateId, 'model-token', { model: modelName, round, token: full });
               }
             }
           } else if (!thinkLeakDetected) {
             emit(debateId, 'model-token', { model: modelName, round, token: tok });
           } else {
-            // thinkLeakDetected=true：仍在英文思考阶段，继续静默累积
-            // 检测是否已切换到中文正文（连续出现中文字符）
             if (/[\u4e00-\u9fff]/.test(tok) && thinkLeakBuf === '') {
-              // 首次检测到中文，标记正文开始；但先缓冲这段过渡内容
               thinkLeakBuf = tok;
             } else if (thinkLeakBuf) {
               thinkLeakBuf += tok;
-              // 缓冲超过 20 字确认是正文而非偶发中文字符
               if (thinkLeakBuf.length > 20) {
                 emit(debateId, 'model-token', { model: modelName, round, token: thinkLeakBuf });
                 thinkLeakBuf = '';
-                thinkLeakDetected = false; // 切回正常推送模式
+                thinkLeakDetected = false;
               }
             }
           }
-        }
-        // 收到 finish_reason 即视为上游生成完毕：某些 provider（如 OpenCode 转发的 minimax）
-        // 发完 finish_reason 后既不发送 [DONE] 也不关闭连接，单纯靠 idle 超时会白白多等 10 分钟。
-        // 此处据此主动结束读取，避免无意义挂起。
-        if (choice.finish_reason) {
-          finishReason = choice.finish_reason;
-          doneSeen = true;
-          streamFinished = true;
-          break;
-        }
-      } catch {}
+      }
     }
   }
   if (streamFinished) { try { reader.cancel().catch(() => {}); } catch {} }
@@ -309,7 +316,7 @@ async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, deba
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`vLLM \u9519\u8bef (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round);
+  const r = await readStream(resp, debateId, modelName, round, false);
   return annotateStreamResult(debateId, modelName, round, r);
 }
 
@@ -318,7 +325,7 @@ async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, max
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
   const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`DeepSeek 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round);
+  const r = await readStream(resp, debateId, modelName, round, false);
   return annotateStreamResult(debateId, modelName, round, r);
 }
 
@@ -327,7 +334,42 @@ async function callGLM(baseUrl, apiKey, modelId, messages, temperature, maxToken
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
   const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
   if (!resp.ok) throw new Error(`GLM 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round);
+  const r = await readStream(resp, debateId, modelName, round, false);
+  return annotateStreamResult(debateId, modelName, round, r);
+}
+
+// Anthropic 协议调用（OpenCode 支持 /v1/messages 端点）
+// 与 OpenAI 兼容协议的差异：
+//   - 端点 /v1/messages（非 /v1/chat/completions）
+//   - 鉴权头 x-api-key + anthropic-version（非 Authorization: Bearer）
+//   - system 提示词是顶层字段（非 messages 数组里的 role:system）
+//   - 流式事件 content_block_delta / message_stop（非 data:[DONE]）
+//   - 推理过程是 thinking_delta（非 reasoning_content），与正文天然分离
+async function callAnthropic(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
+  const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/messages`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01'
+  };
+  // Anthropic: system 是顶层字段，从 messages 里抽出来
+  let systemContent = '';
+  const userMessages = [];
+  for (const m of messages) {
+    if (m.role === 'system') systemContent += (systemContent ? '\n' : '') + m.content;
+    else userMessages.push({ role: m.role, content: m.content });
+  }
+  const body = {
+    model: modelId,
+    messages: userMessages,
+    max_tokens: maxTokens,
+    temperature,
+    stream: true
+  };
+  if (systemContent) body.system = systemContent;
+  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  if (!resp.ok) throw new Error(`OpenCode(Anthropic) 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
+  const r = await readStream(resp, debateId, modelName, round, true);
   return annotateStreamResult(debateId, modelName, round, r);
 }
 
@@ -354,8 +396,8 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
     return callGLM(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
   }
   if (config.provider === 'opencode') {
-    // OpenCode 为 OpenAI 兼容格式，复用 vLLM 流式调用
-    return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
+    // OpenCode 支持 Anthropic 协议（/v1/messages），推理过程天然分离
+    return callAnthropic(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
   }
   return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
 }
@@ -581,8 +623,9 @@ app.post('/api/test-connection', async (req, res) => {
   if (prov === 'opencode') {
     const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/models`;
     try {
+      // Anthropic 协议鉴权头：x-api-key + anthropic-version
       const headers = {};
-      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      if (apiKey) { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01'; }
       const resp = await fetch(url, { headers });
       const data = await resp.json();
       if (data.error) { res.json({ success: false, error: data.error.message || JSON.stringify(data.error) }); return; }
@@ -601,15 +644,37 @@ app.post('/api/test-connection', async (req, res) => {
 app.post('/api/test-model', async (req, res) => {
   const { provider, apiKey, baseUrl, modelId } = req.body;
   const prov = provider || 'vllm';
+  // OpenCode 走 Anthropic 协议，请求/响应格式与 OpenAI 兼容完全不同，单独处理
+  if (prov === 'opencode') {
+    const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/messages`;
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    };
+    try {
+      const resp = await fetch(url, {
+        method: 'POST', headers,
+        body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5, stream: false })
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) {
+        const msg = (data.error && (data.error.message || data.error)) || `HTTP ${resp.status}`;
+        return res.json({ success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
+      }
+      // Anthropic 响应: { content: [{ type: 'text', text: '...' }], ... }
+      const reply = (data.content && data.content[0] && data.content[0].text) || '';
+      res.json({ success: true, model: modelId, reply: reply.slice(0, 60) });
+    } catch (err) { res.json({ success: false, error: err.message }); }
+    return;
+  }
+  // DeepSeek / GLM / vLLM 走 OpenAI 兼容协议
   let url, headers = { 'Content-Type': 'application/json' };
   if (prov === 'deepseek') {
     url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   } else if (prov === 'glm') {
     url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  } else if (prov === 'opencode') {
-    url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   } else {
     url = `${(baseUrl || '').replace(/\/+$/, '')}/chat/completions`;
@@ -625,7 +690,7 @@ app.post('/api/test-model', async (req, res) => {
       const msg = (data.error && (data.error.message || data.error)) || `HTTP ${resp.status}`;
       return res.json({ success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
     }
-    res.json({ success: true, model: modelId, reply: (data.choices?.[0]?.message?.content || '').slice(0, 60) });
+    res.json({ success: true, model: modelId, reply: data.choices?.[0]?.message?.content || '' });
   } catch (err) { res.json({ success: false, error: err.message }); }
 });
 
