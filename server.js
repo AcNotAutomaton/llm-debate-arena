@@ -251,6 +251,39 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
       cleaned = '';
     }
   }
+  // 形态 5：中文思考泄漏（qwen3.8-max 互评阶段）——模型以「我们需要回答用户」
+  //   「我们需要基于辩论记录评价」「我们需要判断辩论中谁...」等复数第一人称自言自语
+  //   开头，分析任务该怎么写、字数够不够、该投给谁、最后一行格式要怎样。
+  //   这是对自身任务的元描述，不会出现在真实评价正文里。
+  //   处理策略（优先级递减）：
+  //   a) 找后续「参与者X：」开头的行 → 从该行保留（标准正文格式）
+  //   b) 找引号内的评价正文（"参与者A：..." 或 「参与者A：..."）→ 提取引号内容
+  //   c) 仅找到 win_res 行 → 保留该行（至少投票不丢）
+  //   d) 以上都没有 → 返回空，让上层重试
+  const cnThinkIdx2 = cleaned.search(/^(我们需要|我们要)(回答|基于|判断|分析|评价|决定|快速评估)/mi);
+  if (cnThinkIdx2 >= 0) {
+    const afterCnThink2 = cleaned.substring(cnThinkIdx2);
+    // a) 标准正文行
+    const bodyMatchCn2 = afterCnThink2.match(/\n(参与者[A-Z][\s：])/);
+    if (bodyMatchCn2 && bodyMatchCn2.index >= 0) {
+      cleaned = afterCnThink2.substring(bodyMatchCn2.index + 1);
+    } else {
+      // b) 引号内的评价正文（qwen 常把草稿写在引号里）
+      const quoteMatch = afterCnThink2.match(/["\u300c\u201c]([^"\u300d\u201d]*参与者[A-Z][^"\u300d\u201d]*)["\u300d\u201d]/);
+      if (quoteMatch && quoteMatch[1]) {
+        cleaned = quoteMatch[1].trim();
+      } else {
+        // c) 仅 win_res 行
+        const winMatch = afterCnThink2.match(/(win_res[:：]\s*[^\n\r，。 ]+)/i);
+        if (winMatch && winMatch[1]) {
+          cleaned = winMatch[1].trim();
+        } else {
+          // d) 整段都是思考，无可用正文 → 丢弃
+          cleaned = '';
+        }
+      }
+    }
+  }
   cleaned = cleaned.trim();
   // 连接被远端意外关闭：把已收到的内容返回（可能为空），标记中断原因
   if (streamError && !interrupted) {
@@ -490,17 +523,29 @@ async function evaluateModels(debateId, session) {
       // 兜底重试：若返回为空（思考泄漏被全部剥光）或没抠到 win_res，
       // 用更短更强制的提示再要一次。这种情况常见于推理模型把预算花在思考、
       // 或把思考伪装成正文写到 content 被 readStream 清理掉后剩空。
-      var mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
-      if ((!text || !mWin) && !retryDone) {
+      // 提取 win_res：要求在行首（允许 ** 前缀），避免误匹配思考段落中间
+      // 出现的伪 win_res。捕获整行后统一清理 * 和内部空格（如「参与者 A」→「参与者A」）。
+      function extractWinRes(s) {
+        if (!s) return "";
+        var m = s.match(/(?:^|\n)\*{0,2}\s*win_res[:：]\s*(.+?)[\n\r]/i);
+        if (!m) return "";
+        var raw = m[1].replace(/\*+/g, '').trim();
+        // 「参与者 A」→「参与者A」
+        raw = raw.replace(/^参与者\s+([A-Z])/, '参与者$1');
+        // 截到首个标点为止（防止「参与者B。中文冒号？」这类尾随内容）
+        raw = raw.replace(/[，。？！,;；].*$/, '').trim();
+        return raw;
+      }
+      var winRes = extractWinRes(text);
+      if ((!text || !winRes) && !retryDone) {
         retryDone = true;
         var retrySys = "只做一件事：直接输出最终投票，不要任何思考、分析、编号列表或  标签。控制在 80 字以内，最后一行严格为「win_res：胜者标识」。胜者标识只能从这些候选中选一个：" + candidates.join("、") + "。";
         var retryUser = "辩论问题：" + session.question + "\n\n辩论记录（简版，仅标识）：\n" + transcript + "\n\n直接给出最终投票，最后一行必须是「win_res：胜者标识」。";
         var retryMsgs = [ { role: "system", content: retrySys }, { role: "user", content: retryUser } ];
         var retryText = await callModel(callConfig, model.id, retryMsgs, 0.3, effMax, debateId, model.name, "eval-retry");
         if (retryText) text = retryText;
-        mWin = text.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
+        winRes = extractWinRes(text);
       }
-      var winRes = mWin ? mWin[1].trim() : "";
       // 校验：winRes 必须是候选之一，否则置空
       if (winRes && candidates.indexOf(winRes) < 0) winRes = "";
       session.evaluations.push({ model: model.name, evaluation: text, winRes: winRes });

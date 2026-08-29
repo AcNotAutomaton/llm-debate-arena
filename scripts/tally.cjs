@@ -82,13 +82,33 @@ function analyzeFile(file) {
     return raw;
   };
 
+  // 提取 win_res：要求在行首（允许 ** 前缀），捕获到行尾（换行或字符串结束），
+  // 然后统一清理 * 和「参与者」与字母间的空格
+  function extractWinRes(s) {
+    if (!s) return '';
+    // 匹配到行尾：换行符或字符串结束（$ 配合 m 标志）
+    const m = s.match(/(?:^|\n)\*{0,2}\s*win_res[:：]\s*([^\n\r]+)/i);
+    if (!m) return '';
+    let raw = m[1].replace(/\*+/g, '').trim();
+    // 去掉「参与者」与字母间的空格：参与者 B → 参与者B
+    raw = raw.replace(/^参与者\s+([A-Z])/, '参与者$1');
+    // 去掉行尾标点后的多余内容
+    raw = raw.replace(/[，。？！,;；].*$/, '').trim();
+    return raw;
+  }
+
   for (let i = 1; i + 1 < parts.length; i += 2) {
     const who = parts[i].trim();
     const txt = parts[i + 1] || '';
-    const m = txt.match(/win_res[:：]\s*([^\n\r，。 ]+)/i);
-    if (m) {
+    // 跳过思考泄漏块（模型自言自语分析任务，没有真正输出评价）
+    if (/^(我们需要|我们要)(回答|基于|判断|分析|评价|决定|快速评估)/m.test(txt.trim()) &&
+        !/\n参与者[A-Z][\s：]/.test('\n' + txt)) {
+      modelVotes[who] = '(思考泄漏)';
+      continue;
+    }
+    const rawWin = extractWinRes(txt);
+    if (rawWin) {
       hasAnyWinRes = true;
-      const rawWin = m[1].trim();
       if (/^参与者[A-Z]$/.test(rawWin)) usedAnonTag = true;
       const win = mapName(rawWin);
       votes[win] = (votes[win] || 0) + 1;
