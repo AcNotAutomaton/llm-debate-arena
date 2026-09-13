@@ -43,7 +43,8 @@ const REASONING_MODEL_MIN_TOKENS = 16384;
 function isReasoningModel(modelId) {
   const id = (modelId || '').toLowerCase();
   // glm-4.6 及以上版本（4.6/4.7/4.8/4.9）均带推理能力，4.5 及以下不带
-  return /^(glm-5|glm-4\.[6-9]|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|.*-r1|.*-thinking|.*-reasoner|.*-air|minimax-m)/i.test(id)
+  // qwen3 的 max/flash 档为混合推理型号（互评时会先输出长独白再给结论），plus 档未观察到思考行为
+  return /^(glm-5|glm-4\.[6-9]|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|qwen3\.\d+-(max|flash)|.*-r1|.*-thinking|.*-reasoner|.*-air|minimax-m)/i.test(id)
       || /thinking|reasoning|reasoner|qwq|o1-|o3-|o4-|-r1$|-air$/i.test(id);
 }
 function effectiveMaxTokens(modelId, userMax) {
@@ -56,9 +57,14 @@ function effectiveMaxTokens(modelId, userMax) {
 //   B) [DONE] 是否真实接收过；若流结束但未收到 [DONE] 视为异常中断
 //   C) 读取 finish_reason，识别 length/最大 token 截断
 // 返回 { text, finishReason, doneSeen, interrupted, interruptedReason }
-const READSTREAM_TIMEOUT_MS = 600000;
+const READSTREAM_TIMEOUT_MS = 300000;
 // fetch 握手阶段超时：上游长时间不返回响应头时中止，避免"一直思考中"卡死整个辩论
-const FETCH_HANDSHAKE_TIMEOUT_MS = 300000;
+const FETCH_HANDSHAKE_TIMEOUT_MS = 120000;
+// 瞬时上游故障自动重试：仅覆盖「尚未流出任何 token」的阶段（连接失败 / HTTP 408/429/5xx）。
+// 流已开始后的中断不重试，避免同一次发言的 token 在前端被重复渲染。
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
+const MODEL_FETCH_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 2000;
 
 // 带 handshake 超时的 fetch：若上游在 HANDSHAKE_MS 内未返回响应头则 abort
 async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
@@ -76,6 +82,38 @@ async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
     throw err;
   }
 }
+
+async function delayModelRetry(attempt, debateId, modelName, round, reason) {
+  const delayMs = RETRY_BASE_DELAY_MS * (attempt + 1);
+  emit(debateId, 'model-retry', {
+    model: modelName, round,
+    nextAttempt: attempt + 2, delayMs,
+    reason: String(reason || '').slice(0, 160)
+  });
+  await new Promise(r => setTimeout(r, delayMs));
+}
+
+// 模型调用统一的重试封装：非瞬时错误直接放行/上抛；
+// 重试耗尽后把最后一次响应原样交还调用方，保留原有错误信息格式。
+async function fetchWithRetry(url, options, debateId, modelName, round) {
+  for (let attempt = 0; ; attempt++) {
+    let resp;
+    try {
+      resp = await fetchWithHandshakeTimeout(url, options);
+    } catch (err) {
+      // 握手超时默认 300s，再等一轮代价太高，直接上抛
+      const msg = (err && err.message) || '';
+      if (attempt >= MODEL_FETCH_RETRIES || msg.includes('未收到响应')) throw err;
+      await delayModelRetry(attempt, debateId, modelName, round, msg);
+      continue;
+    }
+    if (!RETRYABLE_STATUS.has(resp.status) || attempt >= MODEL_FETCH_RETRIES) return resp;
+    const status = resp.status;
+    const snippet = (await resp.text().catch(() => '')).slice(0, 160);
+    await delayModelRetry(attempt, debateId, modelName, round, `HTTP ${status} ${snippet}`);
+  }
+}
+
 async function readStream(resp, debateId, modelName, round, isAnthropic) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
@@ -293,7 +331,8 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
   return {
     text: cleaned || reasoning,
     finishReason, doneSeen, interrupted, interruptedReason,
-    truncatedByToken: finishReason === 'length'
+    // OpenAI 协议截断时 finish_reason 为 'length'，Anthropic 协议 stop_reason 为 'max_tokens'
+    truncatedByToken: finishReason === 'length' || finishReason === 'max_tokens'
   };
 }
 
@@ -347,7 +386,7 @@ async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, deba
   const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
   if (!resp.ok) throw new Error(`vLLM \u9519\u8bef (${resp.status}): ${await resp.text().catch(() => '')}`);
   const r = await readStream(resp, debateId, modelName, round, false);
   return annotateStreamResult(debateId, modelName, round, r);
@@ -356,7 +395,7 @@ async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, deba
 async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
   if (!resp.ok) throw new Error(`DeepSeek 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
   const r = await readStream(resp, debateId, modelName, round, false);
   return annotateStreamResult(debateId, modelName, round, r);
@@ -365,10 +404,18 @@ async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, max
 async function callGLM(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) });
+  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
   if (!resp.ok) throw new Error(`GLM 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
   const r = await readStream(resp, debateId, modelName, round, false);
   return annotateStreamResult(debateId, modelName, round, r);
+}
+
+// OpenCode 必需头：每个对话一个稳定会话 ID，用于路由优化与 prompt 缓存；
+// 缺失时服务端返回 400 MissingSessionID 拒绝路由
+function opencodeSession(parts) {
+  return 'llm-debate-arena/' + parts
+    .map(p => String(p == null ? '' : p).replace(/[^A-Za-z0-9._-]+/g, '_'))
+    .join('/');
 }
 
 // Anthropic 协议调用（OpenCode 支持 /v1/messages 端点）
@@ -383,7 +430,8 @@ async function callAnthropic(baseUrl, apiKey, modelId, messages, temperature, ma
   const headers = {
     'Content-Type': 'application/json',
     'x-api-key': apiKey,
-    'anthropic-version': '2023-06-01'
+    'anthropic-version': '2023-06-01',
+    'x-opencode-session': opencodeSession([debateId, modelName || modelId])
   };
   // Anthropic: system 是顶层字段，从 messages 里抽出来
   let systemContent = '';
@@ -400,7 +448,7 @@ async function callAnthropic(baseUrl, apiKey, modelId, messages, temperature, ma
     stream: true
   };
   if (systemContent) body.system = systemContent;
-  const resp = await fetchWithHandshakeTimeout(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify(body) }, debateId, modelName, round);
   if (!resp.ok) throw new Error(`OpenCode(Anthropic) 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
   const r = await readStream(resp, debateId, modelName, round, true);
   return annotateStreamResult(debateId, modelName, round, r);
@@ -415,7 +463,7 @@ function getModelCallConfig(model, vllmBaseUrl) {
     return { provider: 'glm', baseUrl: model.baseUrl || GLM_BASE_URL, apiKey: model.apiKey || process.env.GLM_API_KEY || '' };
   }
   if (provider === 'opencode') {
-    // OpenCode 为 OpenAI 兼容格式，复用 vLLM 调用逻辑
+    // OpenCode 走 Anthropic 协议（/v1/messages），调用见 callAnthropic
     return { provider: 'opencode', baseUrl: model.baseUrl || OPENCODE_BASE_URL, apiKey: model.apiKey || '' };
   }
   return { provider: 'vllm', baseUrl: model.baseUrl || vllmBaseUrl, apiKey: model.apiKey || '' };
@@ -668,9 +716,13 @@ app.post('/api/test-connection', async (req, res) => {
   if (prov === 'opencode') {
     const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/models`;
     try {
-      // Anthropic 协议鉴权头：x-api-key + anthropic-version
+      // Anthropic 协议鉴权头：x-api-key + anthropic-version；会话头用于路由
       const headers = {};
-      if (apiKey) { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01'; }
+      if (apiKey) {
+        headers['x-api-key'] = apiKey;
+        headers['anthropic-version'] = '2023-06-01';
+        headers['x-opencode-session'] = opencodeSession(['test-connection']);
+      }
       const resp = await fetch(url, { headers });
       const data = await resp.json();
       if (data.error) { res.json({ success: false, error: data.error.message || JSON.stringify(data.error) }); return; }
@@ -695,7 +747,8 @@ app.post('/api/test-model', async (req, res) => {
     const headers = {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01'
+      'anthropic-version': '2023-06-01',
+      'x-opencode-session': opencodeSession(['test-model', crypto.randomUUID()])
     };
     try {
       const resp = await fetch(url, {

@@ -493,6 +493,15 @@ es.addEventListener("model-start", (e) => {
     if (state.thinkingTimers && state.thinkingTimers[data.model]) { clearTimeout(state.thinkingTimers[data.model]); delete state.thinkingTimers[data.model]; }
   });
 
+  es.addEventListener("model-retry", (e) => {
+    const data = JSON.parse(e.data);
+    const idx = getCardIndex(data.model);
+    if (idx >= 0) {
+      addStreamNotice(idx, "⚠️ 上游瞬时故障（" + data.reason + "），" + (data.delayMs / 1000) + "s 后自动重试", "notice-interrupt");
+      setCardStatus(idx, "thinking", "自动重试中...");
+    }
+  });
+
   es.addEventListener("model-done", (e) => {
     const data = JSON.parse(e.data);
     if (state.thinkingTimers && state.thinkingTimers[data.model]) { clearTimeout(state.thinkingTimers[data.model]); delete state.thinkingTimers[data.model]; }
@@ -604,7 +613,7 @@ function showResults(data) {
       // 把 win_res 行从评价正文里分离出来单独高亮
       var full = ev.evaluation || '';
       var winRes = ev.winRes || '';
-      var m = full.match(/win_res[:：][^\n\r]*/i);
+      var m = full.match(/(?:^|\n)\*{0,2}\s*win_res[:：][^\n\r]*/i);
       var body = m ? full.replace(m[0], '').replace(/\n+$/, '') : full;
       html += '<div class="eval-card"><div class="eval-name">' + escapeHtml(ev.model);
       if (winRes) html += ' <span class="vote-badge">投：' + escapeHtml(winRes) + '</span>';
