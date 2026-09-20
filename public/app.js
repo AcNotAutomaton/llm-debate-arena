@@ -11,7 +11,6 @@ const COLORS = [
 
 const state = {
   config: {
-    vllmUrl: "http://localhost:8000/v1",
     deepseekApiKey: "",
     deepseekModels: [],
     glmApiKey: "",
@@ -22,7 +21,6 @@ const state = {
     temperature: 0.7,
     maxTokens: 2048,
     anonymous: true,
-    models: [],
     selectedModels: [],
   },
   debateId: null,
@@ -37,9 +35,6 @@ const startBtn = q("#startBtn");
 const settingsBtn = q("#settingsBtn");
 const settingsModal = q("#settingsModal");
 const closeSettings = q("#closeSettings");
-const vllmUrlInput = q("#vllmUrl");
-const testConnBtn = q("#testConnBtn");
-const connStatus = q("#connStatus");
 const modelList = q("#modelList");
 const deepseekApiKeyInput = q("#deepseekApiKey");
 const testDSBtn = q("#testDSBtn");
@@ -246,21 +241,19 @@ saveSettingsBtn.onclick = () => {
   state.config.temperature = parseFloat(temperatureInput.value) || 0.7;
   state.config.maxTokens = parseInt(maxTokensInput.value) || 2048;
   state.config.anonymous = anonymousToggle.checked;
+  state.config.deepseekApiKey = deepseekApiKeyInput.value.trim();
+  state.config.glmApiKey = glmApiKeyInput.value.trim();
+  state.config.opencodeApiKey = opencodeApiKeyInput.value.trim();
   state.config.selectedModels = [...document.querySelectorAll(".model-item input:checked")].map(cb => ({
     id: cb.dataset.modelId,
     name: cb.dataset.modelName,
-    provider: cb.dataset.provider || "vllm",
+    provider: cb.dataset.provider,
     apiKey: cb.dataset.provider === "deepseek" ? state.config.deepseekApiKey : "",
-    // apiKey is set inline below for glm
   }));
   state.config.selectedModels.forEach(m => {
     if (m.provider === "glm") m.apiKey = state.config.glmApiKey;
     else if (m.provider === "opencode") m.apiKey = state.config.opencodeApiKey;
   });
-  state.config.deepseekApiKey = deepseekApiKeyInput.value.trim();
-  state.config.glmApiKey = glmApiKeyInput.value.trim();
-  state.config.opencodeApiKey = opencodeApiKeyInput.value.trim();
-  state.config.vllmUrl = vllmUrlInput.value;
   updateConfigSummary();
   settingsModal.classList.remove("active");
 };
@@ -272,45 +265,15 @@ function updateConfigSummary() {
   startBtn.disabled = n < 2 || state.isRunning;
 }
 
-testConnBtn.onclick = async () => {
-  const url = vllmUrlInput.value.trim();
-  if (!url) return;
-  connStatus.textContent = "\u6b63\u5728\u8fde\u63a5...";
-  connStatus.className = "conn-status";
-  testConnBtn.disabled = true;
-  try {
-    const resp = await fetch("/api/test-connection", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ baseUrl: url })
-    });
-    const data = await resp.json();
-    if (data.success) {
-      connStatus.textContent = "\u2713 \u8fde\u63a5\u6210\u529f! \u68c0\u6d4b\u5230 " + data.models.length + " \u4e2a\u6a21\u578b";
-      connStatus.className = "conn-status conn-success";
-      state.config.models = data.models;
-      renderModelList();
-    } else {
-      connStatus.textContent = "\u2717 " + data.error;
-      connStatus.className = "conn-status conn-error";
-    }
-  } catch (err) {
-    connStatus.textContent = "\u2717 " + err.message;
-    connStatus.className = "conn-status conn-error";
-  }
-  testConnBtn.disabled = false;
-};
-
 function renderModelList() {
-  const vllmModels = state.config.models.map(m => ({ ...m, provider: "vllm" }));
   const dsModels = state.config.deepseekModels.map(m => ({ ...m, provider: "deepseek" }));
   const glmModels = state.config.glmModels.map(m => ({ ...m, provider: "glm" }));
   const opencodeModels = state.config.opencodeModels.map(m => ({ ...m, provider: "opencode" }));
-  const allModels = [...vllmModels, ...dsModels, ...glmModels, ...opencodeModels];
+  const allModels = [...dsModels, ...glmModels, ...opencodeModels];
   modelList.innerHTML = allModels.map((m, i) => {
     const checked = state.config.selectedModels.some(s => s.id === m.id && s.provider === m.provider) ? "checked" : "";
     const color = COLORS[i % COLORS.length];
-    let badge = '<span class="provider-badge vllm">vLLM</span>';
+    let badge = "";
     if (m.provider === "deepseek") badge = '<span class="provider-badge ds">DeepSeek</span>';
     if (m.provider === "glm") badge = '<span class="provider-badge glm">GLM</span>';
     if (m.provider === "opencode") badge = '<span class="provider-badge opencode">OpenCode</span>';
@@ -358,7 +321,6 @@ async function startDebate() {
           return { id: m.id, name: m.name, provider: m.provider, apiKey };
         }),
         rounds: state.config.rounds,
-        vllmBaseUrl: state.config.vllmUrl,
         temperature: state.config.temperature,
         maxTokens: state.config.maxTokens,
         anonymous: state.config.anonymous,
@@ -380,7 +342,7 @@ function initArena(models) {
     const card = document.createElement("div");
     card.className = "model-card";
     card.id = "card-" + i;
-    let bdg = '<span class="provider-badge vllm" style="font-size:10px">vLLM</span>';
+    let bdg = "";
     if (m.provider === "deepseek") bdg = '<span class="provider-badge ds" style="font-size:10px">DeepSeek</span>';
     if (m.provider === "glm") bdg = '<span class="provider-badge glm" style="font-size:10px">GLM</span>';
     if (m.provider === "opencode") bdg = '<span class="provider-badge opencode" style="font-size:10px">OpenCode</span>';
@@ -639,17 +601,6 @@ function resetUI() {
 }
 
 updateConfigSummary();
-(async () => {
-  try {
-    const resp = await fetch("/api/test-connection", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ baseUrl: state.config.vllmUrl })
-    });
-    const data = await resp.json();
-    if (data.success) { state.config.models = data.models; renderModelList(); }
-  } catch {}
-})();
 
 
 // Theme toggle

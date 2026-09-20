@@ -7,7 +7,7 @@
 ## 功能特点
 
 - **链式辩论**:模型依次发言,后一个模型基于前一个的回答继续分析,形成深度对话链条
-- **多 Provider 混用**:同时支持本地 vLLM 服务、DeepSeek 云端 API、GLM(智谱)云端 API 和 OpenCode 第三方聚合端点,多种来源的模型可以同台辩论
+- **多 Provider 混用**:同时支持 DeepSeek 云端 API、GLM(智谱)云端 API 和 OpenCode 第三方聚合端点,多种来源的模型可以同台辩论
 - **匿名/实名辩论**:可在设置中切换。匿名模式下模型不知道对手身份(以「参与者A/B」标识),并被告知"对手可能是人类也可能是 AI",形成盲辩;实名模式下模型可见对方真实身份
 - **流式输出**:模型思考过程和回答实时推送到页面,无需等待
 - **模型可用性批量测试**:对 OpenCode 第三方端点的所有模型逐个发最小推理请求,验证哪些模型真正可用(详见下文「为什么需要批量测试」)
@@ -103,11 +103,6 @@ node server.js
    - **再点「🧪 批量测试所有模型可用性」**:逐个验证哪些模型真正可调用,不可用的会标红显示错误
    - 只勾选标绿(可用)的模型
 
-4. **本地 vLLM 模型**(可选):
-   - 在「vLLM 服务地址」输入你的 vLLM 地址(默认 http://localhost:8000/v1)
-   - 点击「测试连接」
-   - 勾选本地模型
-
 ### 开始辩论
 
 1. 在输入框中输入你想要讨论的问题
@@ -198,7 +193,7 @@ node scripts/tally.cjs debates/glm --csv > result.csv
 
 - **后端**:Node.js + Express,使用 SSE(Server-Sent Events)实时推送
 - **前端**:原生 JavaScript + CSS Variables 主题系统
-- **API**:支持 OpenAI 兼容格式(vLLM / OpenCode)、DeepSeek API 和 GLM(智谱)coding API
+- **API**:支持 DeepSeek API、GLM(智谱)coding API 和 OpenCode Anthropic 兼容接口
 - **记录**:Node.js fs 模块写入 Markdown 文件
 
 ## 项目结构

@@ -16,8 +16,6 @@
   --scrollbar-thumb: #334155;
   --judge-bg: linear-gradient(135deg, #1e293b, #1a1a2e);
   --score-bg: #0f172a;
-  --badge-vllm-bg: #334155;
-  --badge-vllm-text: #94a3b8;
   --badge-ds-bg: #1e3a5f;
   --badge-ds-text: #60a5fa;
   --badge-glm-bg: #064e3b;
@@ -42,8 +40,6 @@
   --scrollbar-thumb: #cbd5e1;
   --judge-bg: linear-gradient(135deg, #f8fafc, #f1f5f9);
   --score-bg: #f1f5f9;
-  --badge-vllm-bg: #e2e8f0;
-  --badge-vllm-text: #475569;
   --badge-ds-bg: #dbeafe;
   --badge-ds-text: #2563eb;
   --badge-glm-bg: #d1fae5;
@@ -229,7 +225,6 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
   display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 3px;
   font-weight: 600; vertical-align: middle; margin-left: 4px;
 }
-.provider-badge.vllm { background: var(--btn-secondary-bg); color: var(--text-secondary); }
 .provider-badge.ds { background: #1e3a5f; color: #60a5fa; }
 .provider-badge.glm { background: var(--badge-glm-bg); color: var(--badge-glm-text); }
 .provider-badge.opencode { background: #1a3a2f; color: #34d399; }

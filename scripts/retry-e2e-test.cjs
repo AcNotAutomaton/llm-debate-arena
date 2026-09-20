@@ -126,11 +126,11 @@ function cleanupTestDebates() {
         maxTokens: 64,
         anonymous: true,
         models: [
-          { id: 'flaky-model', name: 'Flaky', provider: 'vllm', baseUrl: MOCK_BASE + '/flaky' },
-          { id: 'stable-model', name: 'Stable', provider: 'vllm', baseUrl: MOCK_BASE + '/stable' }
+          { id: 'flaky-model', name: 'Flaky', provider: 'deepseek', baseUrl: MOCK_BASE + '/flaky' },
+          { id: 'stable-model', name: 'Stable', provider: 'deepseek', baseUrl: MOCK_BASE + '/stable' }
         ],
         judgeModel: 'stable-model',
-        judgeProvider: 'vllm',
+        judgeProvider: 'deepseek',
         judgeBaseUrl: MOCK_BASE + '/stable'
       })
     });

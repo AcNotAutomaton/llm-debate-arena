@@ -66,6 +66,20 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
 const MODEL_FETCH_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 2000;
 
+async function parseProviderResponse(resp) {
+  const text = await resp.text();
+  let data = {};
+  if (text) {
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  }
+  if (!resp.ok || data.error) {
+    const err = data.error || data;
+    const msg = (err && (err.message || err.raw)) || `HTTP ${resp.status}`;
+    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  }
+  return data;
+}
+
 // 带 handshake 超时的 fetch：若上游在 HANDSHAKE_MS 内未返回响应头则 abort
 async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
   const ctrl = new AbortController();
@@ -382,16 +396,6 @@ function buildUserPrompt(question, identifier, history, anonymous) {
   return context;
 }
 
-async function callVLLM(baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, apiKey) {
-  const url = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  const headers = { 'Content-Type': 'application/json' };
-  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
-  if (!resp.ok) throw new Error(`vLLM \u9519\u8bef (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round, false);
-  return annotateStreamResult(debateId, modelName, round, r);
-}
-
 async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
@@ -454,8 +458,8 @@ async function callAnthropic(baseUrl, apiKey, modelId, messages, temperature, ma
   return annotateStreamResult(debateId, modelName, round, r);
 }
 
-function getModelCallConfig(model, vllmBaseUrl) {
-  const provider = model.provider || 'vllm';
+function getModelCallConfig(model) {
+  const provider = model.provider;
   if (provider === 'deepseek') {
     return { provider: 'deepseek', baseUrl: model.baseUrl || DEEPSEEK_BASE_URL, apiKey: model.apiKey || process.env.DEEPSEEK_API_KEY || '' };
   }
@@ -466,7 +470,7 @@ function getModelCallConfig(model, vllmBaseUrl) {
     // OpenCode 走 Anthropic 协议（/v1/messages），调用见 callAnthropic
     return { provider: 'opencode', baseUrl: model.baseUrl || OPENCODE_BASE_URL, apiKey: model.apiKey || '' };
   }
-  return { provider: 'vllm', baseUrl: model.baseUrl || vllmBaseUrl, apiKey: model.apiKey || '' };
+  throw new Error(`不支持的模型 Provider: ${provider || '未指定'}`);
 }
 
 async function callModel(config, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
@@ -480,7 +484,7 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
     // OpenCode 支持 Anthropic 协议（/v1/messages），推理过程天然分离
     return callAnthropic(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
   }
-  return callVLLM(config.baseUrl, modelId, messages, temperature, maxTokens, debateId, modelName, round, config.apiKey);
+  throw new Error(`不支持的模型 Provider: ${config.provider || '未指定'}`);
 }
 
 
@@ -497,7 +501,7 @@ async function runJudge(debateId, session) {
   ];
   try {
     const judgeModelId = session.judgeModel || session.models[0].id;
-    const judgeConfig = session.judgeConfig || getModelCallConfig(session.models[0], session.vllmBaseUrl);
+    const judgeConfig = session.judgeConfig || getModelCallConfig(session.models[0]);
     // 裁判若是推理模型，思考过程同样会吃光预算，沿用自动放大逻辑
     const judgeEffMax = effectiveMaxTokens(judgeModelId, 2048);
     const text = await callModel(judgeConfig, judgeModelId, msgs, 0.3, judgeEffMax, debateId, '裁判', session.rounds + 1);
@@ -562,7 +566,7 @@ async function evaluateModels(debateId, session) {
       { role: "system", content: sysContent },
       { role: "user", content: userContent }
     ];
-    var callConfig = getModelCallConfig(model, session.vllmBaseUrl);
+    var callConfig = getModelCallConfig(model);
     // 互评阶段也需要对推理模型放大 max_tokens——思考过程同样会吃光预算
     var effMax = effectiveMaxTokens(model.id, 512);
     var retryDone = false;
@@ -628,7 +632,7 @@ async function startDebate(debateId) {
       { role: 'user', content: buildUserPrompt(s.question, identifier, s.history, anonymous) }
     ];
     emit(debateId, 'model-start', { model: model.name, round: turnNum });
-    const callConfig = getModelCallConfig(model, s.vllmBaseUrl);
+    const callConfig = getModelCallConfig(model);
     // 推理模型自动放大 max_tokens（思考过程需要），非推理模型沿用用户的设置值
     const effMax = effectiveMaxTokens(model.id, s.maxTokens);
     try {
@@ -690,14 +694,14 @@ async function startDebate(debateId) {
 
 app.post('/api/test-connection', async (req, res) => {
   const { baseUrl, provider, apiKey } = req.body;
-  const prov = provider || 'vllm';
+  const prov = provider;
   if (prov === 'deepseek') {
     const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/models`;
     try {
       const headers = {};
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
       const resp = await fetch(url, { headers });
-      const data = await resp.json();
+      const data = await parseProviderResponse(resp);
       res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
     } catch (err) { res.json({ success: false, error: err.message }); }
     return;
@@ -708,7 +712,7 @@ app.post('/api/test-connection', async (req, res) => {
       const headers = {};
       if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
       const resp = await fetch(url, { headers });
-      const data = await resp.json();
+      const data = await parseProviderResponse(resp);
       res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
     } catch (err) { res.json({ success: false, error: err.message }); }
     return;
@@ -724,23 +728,18 @@ app.post('/api/test-connection', async (req, res) => {
         headers['x-opencode-session'] = opencodeSession(['test-connection']);
       }
       const resp = await fetch(url, { headers });
-      const data = await resp.json();
-      if (data.error) { res.json({ success: false, error: data.error.message || JSON.stringify(data.error) }); return; }
+      const data = await parseProviderResponse(resp);
       res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
     } catch (err) { res.json({ success: false, error: err.message }); }
     return;
   }
-  try {
-    const resp = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`);
-    const data = await resp.json();
-    res.json({ success: true, models: (data.data || []).map(m => ({ id: m.id, name: m.id })) });
-  } catch (err) { res.json({ success: false, error: err.message }); }
+  res.status(400).json({ success: false, error: `不支持的 Provider: ${prov || '未指定'}` });
 });
 
 // 单模型可用性测试：发一次最小推理调用（非流式），判断模型真正可用与否
 app.post('/api/test-model', async (req, res) => {
   const { provider, apiKey, baseUrl, modelId } = req.body;
-  const prov = provider || 'vllm';
+  const prov = provider;
   // OpenCode 走 Anthropic 协议，请求/响应格式与 OpenAI 兼容完全不同，单独处理
   if (prov === 'opencode') {
     const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/messages`;
@@ -766,7 +765,7 @@ app.post('/api/test-model', async (req, res) => {
     } catch (err) { res.json({ success: false, error: err.message }); }
     return;
   }
-  // DeepSeek / GLM / vLLM 走 OpenAI 兼容协议
+  // DeepSeek / GLM 走 OpenAI 兼容协议
   let url, headers = { 'Content-Type': 'application/json' };
   if (prov === 'deepseek') {
     url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
@@ -775,8 +774,7 @@ app.post('/api/test-model', async (req, res) => {
     url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
   } else {
-    url = `${(baseUrl || '').replace(/\/+$/, '')}/chat/completions`;
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    return res.status(400).json({ success: false, error: `不支持的 Provider: ${prov || '未指定'}` });
   }
   try {
     const resp = await fetch(url, {
@@ -793,11 +791,11 @@ app.post('/api/test-model', async (req, res) => {
 });
 
 app.post('/api/debate', (req, res) => {
-  const { question, models, rounds = 3, vllmBaseUrl = 'http://localhost:8000/v1', temperature = 0.7, maxTokens = 2048, anonymous = true, judgeModel, judgeProvider, judgeApiKey, judgeBaseUrl } = req.body;
+  const { question, models, rounds = 3, temperature = 0.7, maxTokens = 2048, anonymous = true, judgeModel, judgeProvider, judgeApiKey, judgeBaseUrl } = req.body;
   if (!question || !models || models.length < 2) return res.status(400).json({ error: '\u9700\u8981\u81f3\u5c112\u4e2a\u6a21\u578b\u53c2\u4e0e\u8fa9\u8bba' });
   const id = crypto.randomUUID();
-    const judgeConfig = judgeProvider ? { provider: judgeProvider, baseUrl: judgeBaseUrl || DEEPSEEK_BASE_URL, apiKey: judgeApiKey || '' } : null;
-  sessions.set(id, { id, question, models, rounds, vllmBaseUrl, temperature, maxTokens, anonymous: anonymous !== false, judgeModel: judgeModel || models[0].id, judgeConfig, status: 'pending', history: new Map(), judgeResult: null, createdAt: Date.now() });
+  const judgeConfig = judgeProvider ? getModelCallConfig({ provider: judgeProvider, baseUrl: judgeBaseUrl, apiKey: judgeApiKey }) : null;
+  sessions.set(id, { id, question, models, rounds, temperature, maxTokens, anonymous: anonymous !== false, judgeModel: judgeModel || models[0].id, judgeConfig, status: 'pending', history: new Map(), judgeResult: null, createdAt: Date.now() });
   sseClients.set(id, new Set());
   startDebate(id).catch(e => console.error(e));
   res.json({ debateId: id });
@@ -823,5 +821,4 @@ const PORT = process.env.PORT || 3456;
 app.listen(PORT, () => {
   console.log(`🎯 LLM \u8fa9\u8bba\u7ade\u6280\u573a\u5df2\u542f\u52a8\uff01`);
   console.log(`   \u672c\u5730\u8bbf\u95ee: http://localhost:${PORT}`);
-  console.log(`   \u8bf7\u786e\u4fdd vLLM \u670d\u52a1\u5df2\u542f\u52a8`);
 });
