@@ -20,6 +20,15 @@
     </div>
   </header>
 
+  <nav class="workspace-nav" aria-label="工作区">
+    <button type="button" data-view="experimentView" aria-current="page">排名实验</button>
+    <button type="button" data-view="debugView">单场调试</button>
+    <button type="button" data-view="recordsView">实验记录</button>
+  </nav>
+  <section id="debugView" class="workspace-view" hidden>
+  <h2>单场调试</h2>
+  <p class="view-description">检查题目、连接和模型回答，再开展批量实验。</p>
+  <p class="view-description">与排名实验共用所选模型和高级参数，请先在「排名实验」中完成配置。单场调试沿用原辩论流程，不等同于排名实验协议。</p>
   <div class="question-bar">
     <textarea id="questionInput" placeholder="输入你的问题，让多个大模型展开辩论..." rows="2"></textarea>
     <button class="btn-start" id="startBtn">⚡ 开始辩论</button>
@@ -29,6 +38,36 @@
     <span id="modelCountText">已选择 0 个模型</span>
     <span id="roundCountText">3 轮辩论</span>
   </div>
+  <div id="debugParameters" class="debug-parameters"></div>
+  <div id="debugOutput"></div>
+  </section>
+
+  <section id="experimentView" class="workspace-view">
+  <section class="experiment-panel" aria-labelledby="experimentTitle">
+    <div class="view-heading"><div><h2 id="experimentTitle">排名实验</h2><p class="view-description">填写提示词 → 循环辩论 → 得出排名</p></div><button id="newExperimentBtn" class="btn-secondary" type="button" hidden>配置下一组</button></div>
+    <div id="experimentSetup" class="experiment-setup">
+      <div class="view-heading"><p>选择 2–4 个模型。</p><button id="connectModelsBtn" class="btn-secondary" type="button">连接模型</button></div>
+      <div id="experimentModelPicker"></div>
+      <p id="modelPickerHint" class="hint-text">尚未加载模型，请先连接模型提供方。</p>
+      <label for="experimentQuestions">提示词</label>
+      <textarea id="experimentQuestions" rows="6" maxlength="4000" placeholder="输入完整提示词，模型将围绕它回答、讨论并互评。"></textarea>
+      <div class="experiment-fields">
+        <label>每阶段循环次数 <input id="experimentRepeats" type="number" min="1" max="10" value="1"></label>
+        <label>每场讨论轮数 <input id="experimentRounds" type="number" min="1" max="10" value="2"></label>
+      </div>
+      <p id="experimentEstimate" class="hint-text">选模型并填写提示词后显示预计场次</p>
+      <p class="hint-text">逐次选出第 1、2、3、4 名（按所选模型数量）。最高票并列时增加讨论轮数加赛，最多 5 次。每场完整讨论自动保存到 debates/ 的 Markdown 文件。</p>
+      <details id="advancedSettings"><summary>高级设置</summary><div id="advancedParameters" class="experiment-fields"></div></details>
+      <button id="startExperimentBtn" class="btn-primary" disabled>开始排名实验</button>
+    </div>
+    <div id="experimentMonitor" hidden>
+    <div id="experimentStatus" class="experiment-status" role="status"></div>
+    <div id="experimentLive" class="experiment-live" hidden></div>
+    <div id="experimentResult"></div>
+    </div>
+  </section>
+  </section>
+  <section id="recordsView" class="workspace-view" hidden><div class="view-heading"><div><h2>实验记录</h2><p class="view-description">查看历史排名、阶段票数和完整讨论。</p></div><button id="refreshRecords" class="btn-secondary" type="button">刷新</button></div><div id="recordsList"></div><div id="recordDetail"></div></section>
 
   <div class="progress-bar" id="progressBar" style="display:none">
     <div class="progress-fill" id="progressFill"></div>
@@ -43,25 +82,25 @@
 <div class="modal-overlay" id="settingsModal">
   <div class="modal">
     <div class="modal-header">
-      <h2>辩论设置</h2>
+      <h2>连接模型</h2>
       <button class="btn-icon" id="closeSettings">✕</button>
     </div>
     <div class="modal-body">
       <div class="form-group">
         <label>DeepSeek API 密钥</label>
-        <input type="text" id="deepseekApiKey" placeholder="sk-..." value="">
+        <input type="password" id="deepseekApiKey" placeholder="sk-..." value="">
         <button class="btn-secondary" id="testDSBtn">测试 DeepSeek 连接</button>
         <span id="dsStatus"></span>
       </div>
       <div class="form-group">
         <label>GLM API 密钥</label>
-        <input type="text" id="glmApiKey" placeholder="..." value="">
+        <input type="password" id="glmApiKey" placeholder="..." value="">
         <button class="btn-secondary" id="testGLMBtn">测试 GLM 连接</button>
         <span id="glmStatus"></span>
       </div>
       <div class="form-group">
         <label>OpenCode API 密钥（https://opencode.ai/zen/go/v1）</label>
-        <input type="text" id="opencodeApiKey" placeholder="opencode-..." value="">
+        <input type="password" id="opencodeApiKey" placeholder="opencode-..." value="">
         <button class="btn-secondary" id="testOpenCodeBtn">测试 OpenCode 连接</button>
         <button class="btn-secondary" id="batchTestOpenCodeBtn" title="用填好的密钥逐个发最小推理请求，验证每个模型真实可用性">🧪 批量测试所有模型可用性</button>
         <span id="opencodeStatus"></span>
@@ -73,7 +112,7 @@
       </div>
       <div class="form-group">
         <label>辩论轮数</label>
-        <input type="number" id="roundsInput" value="10" min="2" max="50">
+        <input type="number" id="roundsInput" value="3" min="1" max="10">
       </div>
       <div class="form-group">
         <label>匿名辩论</label>
@@ -101,5 +140,6 @@
 </div>
 
 <script src="app.js"></script>
+<script src="workspace.js"></script>
 </body>
 </html>

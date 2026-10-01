@@ -145,7 +145,8 @@ function cleanupTestDebates() {
     const pass = retries.length >= 2
       && !!flakyDone && /pong/.test(flakyDone.data.fullText || '')
       && !!stableDone && /pong/.test(stableDone.data.fullText || '')
-      && !!end && end.data.aborted !== true;
+      && !!end && end.data.aborted !== true
+      && end.data.judgeText === 'pong';
 
     console.log(`flaky 503 hits: ${Math.min(flakyHits, 2)}, retry events: ${retries.length}`);
     console.log(`flaky completed: ${!!flakyDone}, stable completed: ${!!stableDone}, debate aborted: ${end ? !!end.data.aborted : 'n/a'}`);

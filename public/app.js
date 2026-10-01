@@ -68,6 +68,17 @@ const progressText = q("#progressText");
 const modelCountText = q("#modelCountText");
 const roundCountText = q("#roundCountText");
 const themeToggle = q("#themeToggle");
+const experimentQuestions = q("#experimentQuestions");
+const experimentRepeats = q("#experimentRepeats");
+const experimentRounds = q("#experimentRounds");
+const experimentEstimate = q("#experimentEstimate");
+const startExperimentBtn = q("#startExperimentBtn");
+const experimentStatus = q("#experimentStatus");
+const experimentLive = q("#experimentLive");
+const experimentResult = q("#experimentResult");
+let experimentPoll = null;
+let liveDebateId = null;
+let experimentSummaryKey = null;
 
 settingsBtn.onclick = () => settingsModal.classList.add("active");
 closeSettings.onclick = () => settingsModal.classList.remove("active");
@@ -221,7 +232,19 @@ batchTestOpenCodeBtn.onclick = async () => {
       } else {
         failCount++;
         item.className = "batch-item batch-fail";
-        item.innerHTML = '<span class="batch-icon">❌</span><span class="batch-name">' + m.id + '</span><span class="batch-msg">' + (data.error || "失败") + "</span>";
+        const message = data.deprecated ? `已停用，请选择 ${data.replacement} 并重新保存模型配置` : (data.error || '失败');
+        if (data.deprecated) {
+          m.deprecated = true;
+          m.replacement = data.replacement;
+          for (const checkbox of document.querySelectorAll('.model-item input')) {
+            if (checkbox.dataset.provider === 'opencode' && checkbox.dataset.modelId === m.id) {
+              checkbox.checked = false;
+              checkbox.disabled = true;
+              checkbox.closest('.model-item').querySelector('.model-id').textContent = `${m.id}（已停用，请选择 ${data.replacement}）`;
+            }
+          }
+        }
+        item.innerHTML = '<span class="batch-icon">❌</span><span class="batch-name">' + escapeHtml(m.id) + '</span><span class="batch-msg">' + escapeHtml(message) + '</span>';
       }
     } catch (err) {
       failCount++;
@@ -238,13 +261,13 @@ batchTestOpenCodeBtn.onclick = async () => {
 
 saveSettingsBtn.onclick = () => {
   state.config.rounds = parseInt(roundsInput.value) || 3;
-  state.config.temperature = parseFloat(temperatureInput.value) || 0.7;
+  state.config.temperature = Number.isFinite(parseFloat(temperatureInput.value)) ? parseFloat(temperatureInput.value) : 0.7;
   state.config.maxTokens = parseInt(maxTokensInput.value) || 2048;
   state.config.anonymous = anonymousToggle.checked;
   state.config.deepseekApiKey = deepseekApiKeyInput.value.trim();
   state.config.glmApiKey = glmApiKeyInput.value.trim();
   state.config.opencodeApiKey = opencodeApiKeyInput.value.trim();
-  state.config.selectedModels = [...document.querySelectorAll(".model-item input:checked")].map(cb => ({
+  state.config.selectedModels = [...document.querySelectorAll(".model-item input:checked:not(:disabled)")].map(cb => ({
     id: cb.dataset.modelId,
     name: cb.dataset.modelName,
     provider: cb.dataset.provider,
@@ -262,7 +285,9 @@ function updateConfigSummary() {
   const n = state.config.selectedModels.length;
   modelCountText.textContent = n > 0 ? "\u5df2\u9009\u62e9 " + n + " \u4e2a\u6a21\u578b" : "\u5df2\u9009\u62e9 0 \u4e2a\u6a21\u578b";
   roundCountText.textContent = state.config.rounds + " \u8f6e\u8fa9\u8bba" + (state.config.anonymous ? " · 匿名" : " · 实名");
-  startBtn.disabled = n < 2 || state.isRunning;
+  startBtn.disabled = n < 2 || state.isRunning || state.isExperimentRunning;
+  startExperimentBtn.disabled = n < 2 || n > 4 || state.isRunning || state.isExperimentRunning;
+  updateExperimentEstimate();
 }
 
 function renderModelList() {
@@ -271,19 +296,19 @@ function renderModelList() {
   const opencodeModels = state.config.opencodeModels.map(m => ({ ...m, provider: "opencode" }));
   const allModels = [...dsModels, ...glmModels, ...opencodeModels];
   modelList.innerHTML = allModels.map((m, i) => {
-    const checked = state.config.selectedModels.some(s => s.id === m.id && s.provider === m.provider) ? "checked" : "";
+    const checked = !m.deprecated && state.config.selectedModels.some(s => s.id === m.id && s.provider === m.provider) ? "checked" : "";
     const color = COLORS[i % COLORS.length];
     let badge = "";
     if (m.provider === "deepseek") badge = '<span class="provider-badge ds">DeepSeek</span>';
     if (m.provider === "glm") badge = '<span class="provider-badge glm">GLM</span>';
     if (m.provider === "opencode") badge = '<span class="provider-badge opencode">OpenCode</span>';
     return "<div class=\"model-item\">" +
-      '<input type="checkbox" id="m-' + i + '" data-model-id="' + m.id + '" data-model-name="' + m.name + '" data-provider="' + m.provider + '" ' + checked + '">' +
+      '<input type="checkbox" id="m-' + i + '" data-model-id="' + m.id + '" data-model-name="' + m.name + '" data-provider="' + m.provider + '" ' + checked + (m.deprecated ? ' disabled' : '') + '>' +
       "<label for=\"m-" + i + '">' +
         '<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + color.bg + ';margin-right:6px"></span> ' +
         m.name + " " + badge +
       "</label>" +
-      '<span class="model-id">' + m.id + "</span>" +
+      '<span class="model-id">' + escapeHtml(m.id) + (m.deprecated ? '（已停用，请选择 ' + escapeHtml(m.replacement) + '）' : '') + '</span>' +
     "</div>";
   }).join("");
 }
@@ -364,7 +389,7 @@ function addRoundLabel(cardIndex, turn, model) {
   if (!body) return;
   const div = document.createElement("div");
   div.className = "round-label";
-  div.textContent = "\u7b2c " + round + " \u8f6e \u00b7 " + phase;
+  div.textContent = "第 " + turn + " 步 · " + model;
   body.appendChild(div);
 }
 
@@ -549,6 +574,7 @@ es.addEventListener("model-start", (e) => {
 
 function showResults(data) {
   var html = '';
+  if (data.aborted) html += '<div class="judge-text">辩论中断：' + escapeHtml(data.errorMessage || '未知错误') + '</div>';
   var judgeText = data.judgeText || '';
   var evaluations = data.evaluations || [];
   if (judgeText) html += '<div class="judge-text">' + escapeHtml(judgeText) + "</div>";
@@ -586,6 +612,7 @@ function showResults(data) {
     html += '</div>';
   }
   judgePanel.innerHTML = html;
+  judgePanel.style.display = html ? "block" : "none";
 }
 
 function escapeHtml(text) {
@@ -596,8 +623,171 @@ function escapeHtml(text) {
 
 function resetUI() {
   state.isRunning = false;
-  startBtn.disabled = !(state.config.selectedModels.length >= 2);
+  updateConfigSummary();
   startBtn.textContent = "\u26a1 \u5f00\u59cb\u8fa9\u8bba";
+}
+
+function experimentQuestionList() {
+  const prompt = experimentQuestions.value.trim();
+  return prompt ? [prompt] : [];
+}
+
+function updateExperimentEstimate() {
+  const n = state.config.selectedModels.length;
+  const repeats = Number(experimentRepeats.value) || 0;
+  experimentEstimate.textContent = n >= 2 && n <= 4 && experimentQuestionList().length && repeats
+    ? `${n} 个模型 · 基础 ${repeats * (n - 1)} 场（每场独立回答 1 轮 + 讨论 ${experimentRounds.value} 轮；并列另加赛）`
+    : "选模型并填写提示词后显示预计场次";
+}
+
+async function readExperiment(id) {
+  const response = await fetch("/api/experiments/" + encodeURIComponent(id));
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "无法读取实验结果");
+  return data;
+}
+
+function renderExperiment(data) {
+  q('#experimentMonitor').dataset.running = String(['running', 'pending'].includes(data.status));
+  q('#experimentSetup').hidden = true;
+  q('#experimentMonitor').hidden = false;
+  q('#newExperimentBtn').hidden = ['running', 'pending'].includes(data.status);
+  const stage = data.stages[data.stages.length - 1];
+  const stageText = stage ? `；当前第 ${stage.position} 名候选：${stage.candidates.join("、")}` : "";
+  const statusName = { pending: "等待开始", running: "运行中", completed: "已完成", tied: "出现并列", failed: "运行失败", interrupted: "运行中断" }[data.status] || data.status;
+  experimentStatus.textContent = `${statusName} · ${data.completedDebates}/${data.totalDebates} 场${stageText}` + (data.error ? `；${data.error}` : "");
+  renderExperimentLive(data.current);
+  const summaryKey = JSON.stringify([data.id, data.status, data.completedDebates, data.ranking, data.stages.map(s => [s.winner, s.runs.length]), data.error]);
+  if (summaryKey === experimentSummaryKey) return;
+  experimentSummaryKey = summaryKey;
+  let html = "";
+  if (data.ranking.length) {
+    html += `<h3>排名</h3><ol>${data.ranking.map(name => `<li>${escapeHtml(name)}</li>`).join("")}</ol>`;
+  }
+  if (data.status === "completed") {
+    html += '<p>排名已完成，每场讨论已保存到 debates/ 的 Markdown 文件。</p>';
+  } else if (data.status === "tied") {
+    html += `<p>第 ${data.tie.position} 名并列：${data.tie.models.map(escapeHtml).join("、")}。${escapeHtml(data.tie.reason || "请增加辩题或重复次数后重新运行。")}</p>`;
+  }
+  for (const stage of data.stages) {
+    html += `<details><summary>第 ${stage.position} 名：${stage.winner ? escapeHtml(stage.winner) : "统计中"}（${stage.runs.length} 场）</summary>`;
+    html += '<div class="stage-votes">' + Object.entries(stage.votes).map(([name, count]) => `<span>${escapeHtml(name)}：${count} 票</span>`).join("") + '</div>';
+    html += '<ol>' + stage.runs.map(run => `<li>辩题 ${run.questionIndex} · ${run.tiebreak ? `加赛 ${run.tiebreak}` : `重复 ${run.repeat}`}${run.discussionRounds ? ` · 讨论 ${run.discussionRounds} 轮` : ''} · ${Object.entries(run.votes).map(([name, count]) => `${escapeHtml(name)} ${count}`).join(" / ")} · ${run.recordFile ? `<a href="/api/debate-records/${encodeURIComponent(run.recordFile)}" target="_blank" rel="noopener">查看完整讨论记录</a>` : '<span>记录未保存</span>'}</li>`).join("") + '</ol></details>';
+  }
+  experimentResult.innerHTML = html;
+}
+
+function renderExperimentLive(current) {
+  if (!current) {
+    experimentLive.hidden = true;
+    liveDebateId = null;
+    return;
+  }
+  experimentLive.hidden = false;
+  if (liveDebateId !== current.debateId) {
+    liveDebateId = current.debateId;
+    experimentLive.innerHTML = '<h3>当前场次</h3><p class="live-meta"></p><p class="live-question"></p><div class="live-speeches"></div><p class="live-phase"></p><pre class="live-text"></pre><div class="live-evaluations"></div>';
+  }
+  experimentLive.querySelector('.live-meta').textContent = `第 ${current.stage} 阶段 · 辩题 ${current.questionIndex} · ${current.tiebreak ? `第 ${current.tiebreak} 次加赛` : `第 ${current.repeat} 次重复`}${current.discussionRounds ? ` · 讨论 ${current.discussionRounds} 轮` : ''} · 发言顺序：${current.speakerOrder.join(' → ')}`;
+  experimentLive.querySelector('.live-question').textContent = `辩题：${current.question}`;
+  experimentLive.querySelector('.live-phase').textContent = `${current.phase} · 第 ${current.step}/${current.totalSteps} 步${current.model ? ' · ' + current.model : ''}${current.error ? ' · ' + current.error : ''}`;
+  experimentLive.querySelector('.live-text').textContent = current.text || (current.phase === '独立回答' || current.phase.startsWith('讨论') ? '等待模型输出...' : '');
+  const speeches = experimentLive.querySelector('.live-speeches');
+  while (speeches.children.length < current.speeches.length) {
+    const speech = current.speeches[speeches.children.length];
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = `第 ${speech.step} 步 · ${speech.model}（点击展开发言）`;
+    const body = document.createElement('pre');
+    body.textContent = speech.text;
+    details.append(summary, body);
+    speeches.appendChild(details);
+  }
+  experimentLive.querySelector('.live-evaluations').textContent = current.evaluations.length
+    ? '互评投票：' + current.evaluations.map(ev => `${ev.model} → ${ev.winRes || '无有效投票'}`).join('；')
+    : '';
+}
+
+async function pollExperiment(id) {
+  try {
+    const data = await readExperiment(id);
+    renderExperiment(data);
+    if (["completed", "tied", "failed", "interrupted"].includes(data.status)) {
+      clearInterval(experimentPoll);
+      experimentPoll = null;
+      state.isExperimentRunning = false;
+      updateConfigSummary();
+    }
+  } catch (error) {
+    clearInterval(experimentPoll);
+    experimentPoll = null;
+    state.isExperimentRunning = false;
+    updateConfigSummary();
+    experimentStatus.textContent = error.message;
+  }
+}
+
+startExperimentBtn.onclick = async () => {
+  q('#experimentMonitor').hidden = false;
+  q('#experimentMonitor').dataset.running = 'false';
+  experimentResult.innerHTML = '';
+  experimentLive.hidden = true;
+  const models = state.config.selectedModels;
+  const questions = experimentQuestionList();
+  const repeats = Number(experimentRepeats.value);
+  if (models.length < 2 || models.length > 4) {
+    experimentStatus.textContent = "请选择 2–4 个模型";
+    return;
+  }
+  if (!questions.length || questions[0].length > 4000) {
+    experimentStatus.textContent = "请填写提示词，不超过 4000 字";
+    return;
+  }
+  if (!Number.isInteger(repeats) || repeats < 1 || repeats > 10) {
+    experimentStatus.textContent = "每阶段循环次数应为 1–10";
+    return;
+  }
+  state.isExperimentRunning = true;
+  updateConfigSummary();
+  experimentStatus.textContent = "正在创建实验...";
+  experimentResult.innerHTML = "";
+  try {
+    const response = await fetch("/api/experiments", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        models, questions, repetitions: repeats,
+        rounds: Number(experimentRounds.value),
+        temperature: state.config.temperature,
+        maxTokens: state.config.maxTokens, anonymous: true
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "创建实验失败");
+    localStorage.setItem("lastExperimentId", data.id);
+    q('#experimentSetup').hidden = true;
+    q('#newExperimentBtn').hidden = true;
+    await pollExperiment(data.id);
+    if (state.isExperimentRunning) experimentPoll = setInterval(() => pollExperiment(data.id), 1000);
+  } catch (error) {
+    state.isExperimentRunning = false;
+    updateConfigSummary();
+    experimentStatus.textContent = error.message;
+  }
+};
+
+experimentQuestions.addEventListener("input", updateExperimentEstimate);
+experimentRepeats.addEventListener("input", updateExperimentEstimate);
+experimentRounds.addEventListener("input", updateExperimentEstimate);
+const lastExperimentId = localStorage.getItem("lastExperimentId");
+if (lastExperimentId) {
+  readExperiment(lastExperimentId).then(data => {
+    renderExperiment(data);
+    if (["pending", "running"].includes(data.status)) {
+      state.isExperimentRunning = true;
+      updateConfigSummary();
+      experimentPoll = setInterval(() => pollExperiment(lastExperimentId), 1000);
+    }
+  }).catch(() => localStorage.removeItem("lastExperimentId"));
 }
 
 updateConfigSummary();

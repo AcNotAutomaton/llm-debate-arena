@@ -4,8 +4,10 @@ node_modules
 
 
 # local env files
-.env.local
-.env.*.local
+.env
+.env.*
+*.pem
+*.key
 
 # Log files
 npm-debug.log*
@@ -24,3 +26,10 @@ pnpm-debug.log*
 
 # Debate records
 debates/
+experiments/
+
+# Local agent workspace and temporary exports
+.agents/
+.artifact_runtime/
+outputs/
+result.csv

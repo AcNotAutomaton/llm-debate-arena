@@ -3,6 +3,8 @@ const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const experimentProtocol = require('./experiment-protocol.cjs');
+const providerProtocol = require('./provider-protocol.cjs');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 const GLM_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
 const OPENCODE_BASE_URL = 'https://opencode.ai/zen/go/v1';
@@ -14,15 +16,44 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const sessions = new Map();
 const sseClients = new Map();
+const experiments = new Map();
 
 function emit(debateId, event, data) {
+  const session = sessions.get(debateId);
+  const experiment = session?.experimentId ? experiments.get(session.experimentId) : null;
+  const current = experiment?.current;
+  if (current && current.debateId === debateId) {
+    if (event === 'round-start') {
+      current.step = data.turn;
+      current.model = data.model;
+      current.phase = data.phase || '讨论中';
+      current.text = '';
+    } else if (event === 'model-token' && data.type !== 'reasoning') {
+      current.text = (current.text + data.token).slice(-8000);
+    } else if (event === 'model-done') {
+      current.text = (data.fullText || '').slice(-8000);
+      current.speeches.push({ step: data.round, model: data.model, text: (data.fullText || '').slice(0, 12000) });
+    } else if (event === 'model-eval-start') {
+      current.phase = '模型互评中';
+      current.model = '';
+      current.text = '';
+    } else if (event === 'model-evaluation') {
+      current.evaluations.push({ model: data.model, winRes: data.winRes || null });
+    } else if (event === 'model-retry') {
+      current.phase = `${data.model} 自动重试中`;
+    } else if (event === 'model-error') {
+      current.phase = '调用失败';
+      current.error = data.error;
+    } else if (event === 'debate-end') {
+      current.phase = data.aborted ? '辩论中断' : '本场已结束';
+    }
+  }
   const clients = sseClients.get(debateId);
   const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   if (clients && clients.size > 0) {
     for (const res of clients) res.write(msg);
   } else {
-    const session = sessions.get(debateId);
-    if (session) {
+    if (session && session.captureEvents !== false) {
       session.eventBuffer = session.eventBuffer || [];
       session.eventBuffer.push({ event, data });
     }
@@ -128,13 +159,21 @@ async function fetchWithRetry(url, options, debateId, modelName, round) {
   }
 }
 
-async function readStream(resp, debateId, modelName, round, isAnthropic) {
+async function readStream(resp, debateId, modelName, round, isAnthropic, isResponses = false) {
+  if ((resp.headers.get('content-type') || '').includes('application/json')) {
+    const data = await parseProviderResponse(resp);
+    const text = providerProtocol.responseText(data, isAnthropic ? 'anthropic' : isResponses ? 'responses' : 'chat');
+    if (!text.trim()) throw new Error('上游返回空正文，请检查模型权限或输出 token 预算');
+    emit(debateId, 'model-token', { model: modelName, round, token: text });
+    return { text, doneSeen: true, interrupted: false, truncatedByToken: data.status === 'incomplete' || data.stop_reason === 'max_tokens' || data.choices?.[0]?.finish_reason === 'length' };
+  }
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let full = '', reasoning = '', buf = '';
   let doneSeen = false, finishReason = null;
   let interrupted = false, interruptedReason = '';
   let lastTokenTs = Date.now();
+  let readerEnded = false;
   // 英文思考泄漏实时检测状态
   let thinkLeakChecked = false; // 是否已完成开头判定
   let thinkLeakDetected = false; // 开头判定为英文思考，正在静默累积
@@ -144,7 +183,7 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
   async function watchIdle() {
     while (true) {
       await new Promise(r => setTimeout(r, 1000));
-      if (doneSeen || interrupted) return;
+      if (doneSeen || interrupted || readerEnded) return;
       if (Date.now() - lastTokenTs > timeoutMs) {
         interrupted = true; interruptedReason = `超过 ${Math.round(timeoutMs/1000)}s 无新数据`;
         try { reader.cancel().catch(() => {}); } catch {}
@@ -165,21 +204,36 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
       break;
     }
     const { done, value } = chunk;
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+    if (done && !buf) break;
+    buf += decoder.decode(value, { stream: !done });
+    // Some gateways omit the final newline; still process the last SSE data line.
+    if (done && buf) buf += '\n';
     const lines = buf.split('\n');
     buf = lines.pop() || '';
     for (const line of lines) {
       const t = line.trim();
       // —— 协议分支：各自提取 tok / reasonTok，后续共享 think-leak 检测与推送 ——
       let tok = '', reasonTok = '';
-      if (isAnthropic) {
+      if (isResponses) {
+        if (!t.startsWith('data:')) continue;
+        const j = t.slice(5).trim();
+        if (j === '[DONE]') { doneSeen = true; streamFinished = true; break; }
+        let c;
+        try { c = JSON.parse(j); } catch { continue; }
+        if (c.type === 'error' || c.type === 'response.failed') { streamError = new Error(c.message || c.response?.error?.message || 'Responses 接口返回错误'); streamFinished = true; break; }
+        if (c.type === 'response.output_text.delta') tok = c.delta || '';
+        if (c.type === 'response.completed' || c.type === 'response.incomplete') {
+          finishReason = c.type === 'response.incomplete' ? 'length' : 'stop';
+          doneSeen = true; streamFinished = true; break;
+        }
+      } else if (isAnthropic) {
         // Anthropic SSE: event: 行 + data: 行交替
         if (t.startsWith('event:')) { currentEventType = t.slice(6).trim(); continue; }
         if (!t || !t.startsWith('data:')) continue;
         const j = t.slice(5).trim();
         try {
           const c = JSON.parse(j);
+          if (c.type === 'error') { streamError = new Error(c.error?.message || 'Anthropic 流返回错误'); streamFinished = true; break; }
           if (c.type === 'content_block_delta' && c.delta) {
             if (c.delta.type === 'text_delta') tok = c.delta.text || '';
             else if (c.delta.type === 'thinking_delta') reasonTok = c.delta.thinking || '';
@@ -197,11 +251,12 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
         try {
           const c = JSON.parse(j);
           const choice = c.choices?.[0] || {};
+          if (c.error) { streamError = new Error(c.error.message || '上游流返回错误'); streamFinished = true; break; }
           tok = choice.delta?.content || '';
           reasonTok = choice.delta?.reasoning_content || '';
           if (choice.finish_reason) {
             finishReason = choice.finish_reason;
-            doneSeen = true; streamFinished = true; break;
+            doneSeen = true; streamFinished = true;
           }
         } catch {}
       }
@@ -237,9 +292,12 @@ async function readStream(resp, debateId, modelName, round, isAnthropic) {
           }
       }
     }
+    if (done) break;
   }
   if (streamFinished) { try { reader.cancel().catch(() => {}); } catch {} }
+  readerEnded = true;
   await watcher;
+  if (streamError && !full) throw streamError;
   // 兜底：剥离模型把思考过程泄漏到 content（而非 reasoning_content）的情况。
   // 三种已知形态：
   //   1) <think>...</think> 标签包裹（minimax-m3 等），含被 max_tokens 截断的孤立  起始标签
@@ -467,7 +525,7 @@ function getModelCallConfig(model) {
     return { provider: 'glm', baseUrl: model.baseUrl || GLM_BASE_URL, apiKey: model.apiKey || process.env.GLM_API_KEY || '' };
   }
   if (provider === 'opencode') {
-    // OpenCode 走 Anthropic 协议（/v1/messages），调用见 callAnthropic
+    // OpenCode 在调用时按模型选择 Anthropic、Chat Completions 或 Responses 协议。
     return { provider: 'opencode', baseUrl: model.baseUrl || OPENCODE_BASE_URL, apiKey: model.apiKey || '' };
   }
   throw new Error(`不支持的模型 Provider: ${provider || '未指定'}`);
@@ -481,8 +539,12 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
     return callGLM(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
   }
   if (config.provider === 'opencode') {
-    // OpenCode 支持 Anthropic 协议（/v1/messages），推理过程天然分离
-    return callAnthropic(config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round);
+    const request = providerProtocol.requestFor(config.provider, config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, true, opencodeSession([debateId, modelName || modelId]));
+    const resp = await fetchWithRetry(request.url, request.options, debateId, modelName, round);
+    if (!resp.ok) await parseProviderResponse(resp);
+    const result = await readStream(resp, debateId, modelName, round, request.protocol === 'anthropic', request.protocol === 'responses');
+    if (!result.text.trim()) throw new Error('模型返回空正文，请检查输出 token 预算或上游模型状态');
+    return annotateStreamResult(debateId, modelName, round, result);
   }
   throw new Error(`不支持的模型 Provider: ${config.provider || '未指定'}`);
 }
@@ -491,9 +553,8 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
 async function runJudge(debateId, session) {
   emit(debateId, 'judge-start', {});
   let t = `\u8fa9\u8bba\u95ee\u9898\uff1a${session.question}\n\n`;
-  for (const [name, rounds] of session.history) {
-    t += `\n===== ${name} \u7684\u8fa9\u8bba =====\n`;
-    for (const r of rounds) t += `\n\u7b2c${r.round}\u8f6e\uff08${r.phase}\uff09\uff1a\n${r.content}\n`;
+  for (const entry of session.history) {
+    t += `\n\u7b2c${entry.step}\u6b65 - ${entry.model}\uff1a\n${entry.content}\n`;
   }
   const msgs = [
     { role: 'system', content: `\u4f60\u662f\u4e00\u540d\u516c\u6b63\u7684\u8fa9\u8bba\u88c1\u5224\u3002\u8bf7\u6839\u636e\u4ee5\u4e0b\u7ef4\u5ea6\u5bf9\u6bcf\u4f4d\u8fa9\u624b\u8bc4\u5206\uff081-10\u5206\uff09\uff0c\u5e76\u9009\u51fa\u603b\u51a0\u519b\u3002\n\n\u8bc4\u5206\u7ef4\u5ea6\uff1a\n1. \u903b\u8f91\u6027\u548c\u8bba\u8bc1\u8d28\u91cf\n2. \u77e5\u8bc6\u6df1\u5ea6\u548c\u5e7f\u5ea6\n3. \u8bf4\u670d\u529b\u548c\u8868\u8fbe\u529b\n4. \u56de\u5e94\u4ed6\u4eba\u89c2\u70b9\u7684\u80fd\u529b\n5. \u521b\u9020\u6027\u548c\u6d1e\u5bdf\u529b\n\n\u683c\u5f0f\u8981\u6c42\uff1a\n\u8fa9\u624b\u8bc4\u5206\uff1a\n- \u6a21\u578b\u540d: \u5206\u6570\n...\n\u51a0\u519b\uff1a\u6a21\u578b\u540d\n\u8bc4\u8bed\uff1a...` },
@@ -562,6 +623,7 @@ async function evaluateModels(debateId, session) {
       sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后投票评出胜者。控制在200字以内。\n\n重要要求：\n1. 不要输出思考过程、内部独白或任何 <think> 标签内容——直接给出最终评价。\n2. 不要逐条复述辩论内容，直接给出你的评价结论。\n3. 必须确保最后能输出「win_res：胜者标识」这一行，这是最关键的。" + fmtRule;
       userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请直接给出每个模型的评价结论（不要思考过程、不要复述辩论），并在最后一行用「win_res：胜者标识」投票评出胜者。";
     }
+    if (session.protocol) sysContent += '\n\n实验统一评价规则：' + experimentProtocol.rubric;
     var msgs = [
       { role: "system", content: sysContent },
       { role: "user", content: userContent }
@@ -579,7 +641,7 @@ async function evaluateModels(debateId, session) {
       // 出现的伪 win_res。捕获整行后统一清理 * 和内部空格（如「参与者 A」→「参与者A」）。
       function extractWinRes(s) {
         if (!s) return "";
-        var m = s.match(/(?:^|\n)\*{0,2}\s*win_res[:：]\s*(.+?)[\n\r]/i);
+        var m = s.match(/(?:^|\n)\*{0,2}\s*win_res[:：]\s*([^\n\r]+)/i);
         if (!m) return "";
         var raw = m[1].replace(/\*+/g, '').trim();
         // 「参与者 A」→「参与者A」
@@ -592,6 +654,7 @@ async function evaluateModels(debateId, session) {
       if ((!text || !winRes) && !retryDone) {
         retryDone = true;
         var retrySys = "只做一件事：直接输出最终投票，不要任何思考、分析、编号列表或  标签。控制在 80 字以内，最后一行严格为「win_res：胜者标识」。胜者标识只能从这些候选中选一个：" + candidates.join("、") + "。";
+        if (session.protocol) retrySys += '\n' + experimentProtocol.rubric;
         var retryUser = "辩论问题：" + session.question + "\n\n辩论记录（简版，仅标识）：\n" + transcript + "\n\n直接给出最终投票，最后一行必须是「win_res：胜者标识」。";
         var retryMsgs = [ { role: "system", content: retrySys }, { role: "user", content: retryUser } ];
         var retryText = await callModel(callConfig, model.id, retryMsgs, 0.3, effMax, debateId, model.name, "eval-retry");
@@ -618,7 +681,7 @@ async function startDebate(debateId) {
   // 为每个参与方分配一个中立标识（参与者A、参与者B…），匿名模式下用其替代真实模型名，避免泄露身份
   s.labels = s.models.map(function (_, i) { return '参与者' + String.fromCharCode(65 + i); });
   const anonymous = s.anonymous !== false;
-  const totalSteps = s.rounds * s.models.length;
+  const totalSteps = (s.rounds + (s.protocol ? 1 : 0)) * s.models.length;
   emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps, anonymous: anonymous });
   for (let step = 0; step < totalSteps; step++) {
     const modelIdx = step % s.models.length;
@@ -626,10 +689,12 @@ async function startDebate(debateId) {
     const currentLabel = s.labels[modelIdx];
     const identifier = anonymous ? currentLabel : model.name;
     const turnNum = step + 1;
-    emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name });
+    const phase = s.protocol ? (step < s.models.length ? '独立回答' : `讨论第 ${Math.floor(step / s.models.length)} 轮`) : '讨论中';
+    emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name, phase });
+    const visibleHistory = s.protocol ? experimentProtocol.historyForTurn(s.history, step, s.models.length) : s.history;
     const msgs = [
-      { role: 'system', content: buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
-      { role: 'user', content: buildUserPrompt(s.question, identifier, s.history, anonymous) }
+      { role: 'system', content: s.protocol ? experimentProtocol.systemPrompt(identifier, step < s.models.length, s.wordLimit) : buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
+      { role: 'user', content: buildUserPrompt(s.question, identifier, visibleHistory, anonymous) }
     ];
     emit(debateId, 'model-start', { model: model.name, round: turnNum });
     const callConfig = getModelCallConfig(model);
@@ -655,11 +720,15 @@ async function startDebate(debateId) {
     try {
       await evaluateModels(debateId, s);
     } catch (e) { console.error('Eval failed:', e.message); }
-    try {
-      await runJudge(debateId, s);
-      emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
-    } catch (e) {
-      emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
+    if (s.skipJudge) {
+      emit(debateId, 'debate-end', { judgeText: '', scores: {}, winner: '', evaluations: s.evaluations || [] });
+    } else {
+      try {
+        await runJudge(debateId, s);
+        emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
+      } catch (e) {
+        emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
+      }
     }
   }
   try {
@@ -671,7 +740,7 @@ async function startDebate(debateId) {
       String(now.getDate()).padStart(2,'0') + '_' +
       String(now.getHours()).padStart(2,'0') + '-' +
       String(now.getMinutes()).padStart(2,'0') + '-' +
-      String(now.getSeconds()).padStart(2,'0') + '.md';
+      String(now.getSeconds()).padStart(2,'0') + '-' + debateId.slice(0, 8) + '.md';
     let md = '# LLM \u8fa9\u8bba\u8bb0\u5f55\n\n';
     if (s.aborted) md += '**状态**: ❌ 辩论因错误中断\n\n';
     md += '**\u95ee\u9898**: ' + s.question + '\n\n';
@@ -688,9 +757,186 @@ async function startDebate(debateId) {
       }
     }
     require('fs').writeFileSync(require('path').join(dir, filename), md, 'utf-8');
+    s.recordFile = filename;
     console.log('Debate saved: ' + filename);
   } catch (e) { console.error('Save failed:', e.message); }
+  return s;
 }
+
+function saveExperiment(experiment) {
+  const dir = path.join(__dirname, 'experiments');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, experiment.id + '.json'), JSON.stringify(experiment, null, 2), 'utf8');
+}
+
+async function runExperiment(experiment, models) {
+  experiment.status = 'running';
+  saveExperiment(experiment);
+  try {
+    let remaining = models.slice();
+    for (let stageIndex = 0; remaining.length > 1; stageIndex++) {
+      const stage = { position: stageIndex + 1, candidates: remaining.map(m => m.name), votes: {}, runs: [], winner: null, tiebreaks: 0 };
+      for (const model of remaining) stage.votes[model.name] = 0;
+      experiment.stages.push(stage);
+      let plannedRepeats = experiment.repetitions;
+      for (let repeat = 0; repeat < plannedRepeats; repeat++) {
+        const tiebreak = Math.max(0, repeat - experiment.repetitions + 1);
+        const discussionRounds = experiment.rounds + tiebreak;
+        for (let questionIndex = 0; questionIndex < experiment.questions.length; questionIndex++) {
+          const debateId = crypto.randomUUID();
+          // 轮换发言顺序，降低固定首位带来的偏差。
+          const offset = (repeat * experiment.questions.length + questionIndex) % remaining.length;
+          const orderedModels = remaining.slice(offset).concat(remaining.slice(0, offset));
+          experiment.current = {
+            debateId, stage: stageIndex + 1, repeat: repeat + 1, tiebreak, discussionRounds,
+            questionIndex: questionIndex + 1, question: experiment.questions[questionIndex],
+            speakerOrder: orderedModels.map(m => m.name), step: 0,
+            totalSteps: (discussionRounds + 1) * orderedModels.length,
+            model: '', phase: '准备中', text: '', speeches: [], evaluations: []
+          };
+          const session = {
+            id: debateId, question: experiment.questions[questionIndex], models: orderedModels,
+            rounds: discussionRounds, temperature: experiment.temperature,
+            maxTokens: experiment.maxTokens, anonymous: experiment.anonymous,
+            status: 'pending', history: [], evaluations: [], createdAt: Date.now(),
+            captureEvents: false, skipJudge: true, experimentId: experiment.id,
+            protocol: experiment.protocol, wordLimit: experiment.wordLimit
+          };
+          sessions.set(debateId, session);
+          sseClients.set(debateId, new Set());
+          let finished;
+          try {
+            finished = await startDebate(debateId);
+          } finally {
+            sessions.delete(debateId);
+            sseClients.delete(debateId);
+          }
+          if (finished.aborted) throw new Error(`第 ${stageIndex + 1} 阶段第 ${repeat + 1} 次，辩题 ${questionIndex + 1} 的辩论中断；已保留之前的结果`);
+          const votes = {};
+          for (const model of remaining) votes[model.name] = 0;
+          const individualVotes = (finished.evaluations || []).map(ev => {
+            let chosen = ev.winRes || '';
+            if (finished.anonymous && /^参与者[A-Z]$/.test(chosen)) {
+              chosen = orderedModels[chosen.charCodeAt(3) - 65]?.name || '';
+            }
+            if (!Object.hasOwn(votes, chosen)) chosen = '';
+            if (chosen) { votes[chosen]++; stage.votes[chosen]++; }
+            return { voter: ev.model, chosen: chosen || null };
+          });
+          stage.runs.push({ debateId, recordFile: finished.recordFile || null, questionIndex: questionIndex + 1, repeat: repeat + 1, tiebreak, discussionRounds, speakerOrder: orderedModels.map(m => m.name), votes, individualVotes });
+          experiment.completedDebates++;
+          experiment.updatedAt = new Date().toISOString();
+          saveExperiment(experiment);
+        }
+        if (repeat === plannedRepeats - 1) {
+          const maxVotes = Math.max(...Object.values(stage.votes));
+          const leaders = Object.keys(stage.votes).filter(name => stage.votes[name] === maxVotes);
+          if (maxVotes === 0) throw new Error(`第 ${stage.position} 阶段没有有效投票；请检查模型互评输出`);
+          if (leaders.length > 1 && stage.tiebreaks < 5) {
+            stage.tiebreaks++;
+            plannedRepeats++;
+            experiment.totalDebates += experiment.questions.length;
+            experiment.updatedAt = new Date().toISOString();
+            saveExperiment(experiment);
+          }
+        }
+      }
+      const maxVotes = Math.max(...Object.values(stage.votes));
+      const leaders = Object.keys(stage.votes).filter(name => stage.votes[name] === maxVotes);
+      if (leaders.length !== 1) {
+        experiment.status = 'tied';
+        experiment.tie = { position: stage.position, models: leaders, reason: '已完成 5 次加赛，累计最高票仍并列' };
+        experiment.updatedAt = new Date().toISOString();
+        saveExperiment(experiment);
+        return;
+      }
+      stage.winner = leaders[0];
+      experiment.ranking.push(leaders[0]);
+      remaining = remaining.filter(m => m.name !== leaders[0]);
+      saveExperiment(experiment);
+    }
+    experiment.ranking.push(remaining[0].name);
+    experiment.status = 'completed';
+  } catch (error) {
+    experiment.status = 'failed';
+    experiment.error = error.message;
+  }
+  experiment.updatedAt = new Date().toISOString();
+  saveExperiment(experiment);
+}
+
+app.post('/api/experiments', (req, res) => {
+  const { models, questions, repetitions = 1, rounds = 2, temperature = 0.7, maxTokens = 2048, wordLimit = 600 } = req.body;
+  const names = Array.isArray(models) ? models.map(m => m.name) : [];
+  if (names.length < 2 || names.length > 4 || new Set(names).size !== names.length ||
+      models.some(m => !m.id || !['deepseek', 'glm', 'opencode'].includes(m.provider))) {
+    return res.status(400).json({ error: '请选择 2–4 个名称不重复且配置完整的模型' });
+  }
+  if (!Array.isArray(questions) || questions.length < 1 || questions.length > 10 || questions.some(q => typeof q !== 'string' || !q.trim() || q.length > 4000)) {
+    return res.status(400).json({ error: '请提供 1–10 道非空辩题（每题不超过 4000 字）' });
+  }
+  if (!Number.isInteger(repetitions) || repetitions < 1 || repetitions > 10 ||
+      !Number.isInteger(rounds) || rounds < 1 || rounds > 10 ||
+      !Number.isInteger(wordLimit) || wordLimit < 200 || wordLimit > 2000 ||
+      typeof temperature !== 'number' || temperature < 0 || temperature > 2 ||
+      !Number.isInteger(maxTokens) || maxTokens < 256 || maxTokens > 65536 ||
+      questions.length * repetitions * (names.length - 1) > 120) {
+    return res.status(400).json({ error: '实验参数超出范围或总场次超过 120 场' });
+  }
+  const id = crypto.randomUUID();
+  const experiment = {
+    id, status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    models: models.map(m => ({ id: m.id, name: m.name, provider: m.provider })),
+    questions: questions.map(q => q.trim()), repetitions, rounds, temperature, maxTokens,
+    anonymous: true, protocol: 'prompt-discussion-v4', wordLimit, rubric: experimentProtocol.rubric,
+    totalDebates: questions.length * repetitions * (names.length - 1),
+    completedDebates: 0, stages: [], ranking: []
+  };
+  experiments.set(id, experiment);
+  saveExperiment(experiment);
+  setImmediate(() => runExperiment(experiment, models));
+  res.status(202).json({ id });
+});
+
+app.get('/api/experiments', (req, res) => {
+  const dir = path.join(__dirname, 'experiments');
+  const items = [];
+  if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir)) {
+    if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
+    try {
+      const item = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      const live = experiments.get(item.id) || item;
+      items.push({ id: live.id, createdAt: live.createdAt, status: !experiments.has(item.id) && ['running', 'pending'].includes(live.status) ? 'interrupted' : live.status, models: live.models.map(m => m.name), completedDebates: live.completedDebates, totalDebates: live.totalDebates });
+    } catch { /* 单个损坏记录不阻塞列表 */ }
+  }
+  res.json(items.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+});
+
+app.get('/api/experiments/:id', (req, res) => {
+  let experiment = experiments.get(req.params.id);
+  if (!experiment && /^[0-9a-f-]{36}$/.test(req.params.id)) {
+    const file = path.join(__dirname, 'experiments', req.params.id + '.json');
+    if (fs.existsSync(file)) {
+      experiment = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (['pending', 'running'].includes(experiment.status)) {
+        experiment.status = 'interrupted';
+        experiment.error = '服务曾重启，实验未继续运行；已完成的场次仍保存在结果中';
+      }
+    }
+  }
+  if (!experiment) return res.status(404).json({ error: '实验不存在' });
+  res.json(experiment);
+});
+
+app.get('/api/debate-records/:filename', (req, res) => {
+  const filename = req.params.filename;
+  if (!/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[0-9a-f]{8}\.md$/.test(filename)) {
+    return res.status(400).send('无效的记录文件名');
+  }
+  const file = path.join(__dirname, 'debates', filename);
+  if (!fs.existsSync(file)) return res.status(404).send('记录不存在');
+  res.type('text/plain; charset=utf-8').sendFile(file);
+});
 
 app.post('/api/test-connection', async (req, res) => {
   const { baseUrl, provider, apiKey } = req.body;
@@ -722,6 +968,9 @@ app.post('/api/test-connection', async (req, res) => {
     try {
       // Anthropic 协议鉴权头：x-api-key + anthropic-version；会话头用于路由
       const headers = {};
+      headers['User-Agent'] = 'llm-debate-arena/1.0';
+      headers['x-opencode-session'] = opencodeSession(['test-connection']);
+      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
       if (apiKey) {
         headers['x-api-key'] = apiKey;
         headers['anthropic-version'] = '2023-06-01';
@@ -739,55 +988,21 @@ app.post('/api/test-connection', async (req, res) => {
 // 单模型可用性测试：发一次最小推理调用（非流式），判断模型真正可用与否
 app.post('/api/test-model', async (req, res) => {
   const { provider, apiKey, baseUrl, modelId } = req.body;
-  const prov = provider;
-  // OpenCode 走 Anthropic 协议，请求/响应格式与 OpenAI 兼容完全不同，单独处理
-  if (prov === 'opencode') {
-    const url = `${(baseUrl || OPENCODE_BASE_URL).replace(/\/+$/, '')}/messages`;
-    const headers = {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'x-opencode-session': opencodeSession(['test-model', crypto.randomUUID()])
-    };
-    try {
-      const resp = await fetch(url, {
-        method: 'POST', headers,
-        body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5, stream: false })
-      });
-      const data = await resp.json();
-      if (!resp.ok || data.error) {
-        const msg = (data.error && (data.error.message || data.error)) || `HTTP ${resp.status}`;
-        return res.json({ success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
-      }
-      // Anthropic 响应: { content: [{ type: 'text', text: '...' }], ... }
-      const reply = (data.content && data.content[0] && data.content[0].text) || '';
-      res.json({ success: true, model: modelId, reply: reply.slice(0, 60) });
-    } catch (err) { res.json({ success: false, error: err.message }); }
-    return;
-  }
-  // DeepSeek / GLM 走 OpenAI 兼容协议
-  let url, headers = { 'Content-Type': 'application/json' };
-  if (prov === 'deepseek') {
-    url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  } else if (prov === 'glm') {
-    url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-  } else {
-    return res.status(400).json({ success: false, error: `不支持的 Provider: ${prov || '未指定'}` });
-  }
   try {
-    const resp = await fetch(url, {
-      method: 'POST', headers,
-      body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 5, stream: false })
-    });
-    const data = await resp.json();
-    if (!resp.ok || data.error) {
-      const msg = (data.error && (data.error.message || data.error)) || `HTTP ${resp.status}`;
-      return res.json({ success: false, error: typeof msg === 'string' ? msg : JSON.stringify(msg) });
-    }
-    res.json({ success: true, model: modelId, reply: data.choices?.[0]?.message?.content || '' });
-  } catch (err) { res.json({ success: false, error: err.message }); }
+    if (typeof modelId !== 'string' || !modelId.trim()) return res.status(400).json({ success: false, error: '请提供模型 ID' });
+    const config = getModelCallConfig({ provider, apiKey, baseUrl });
+    const request = providerProtocol.requestFor(provider, config.baseUrl, config.apiKey, modelId,
+      [{ role: 'user', content: '请只回复 OK。' }], undefined, isReasoningModel(modelId) ? 4096 : 512, false,
+      opencodeSession(['test-model', crypto.randomUUID()]));
+    const resp = await fetchWithHandshakeTimeout(request.url, request.options, 30000);
+    const data = await parseProviderResponse(resp);
+    const reply = providerProtocol.responseText(data, request.protocol);
+    if (!reply.trim()) throw new Error('接口已响应，但没有返回正文；可能是推理预算耗尽，不能确认模型可用');
+    return res.json({ success: true, model: modelId, reply: reply.slice(0, 60), protocol: request.protocol });
+  } catch (err) {
+    const replacement = /deprecated[\s\S]*?Use\s+([\w.\/-]+)\s+instead/i.exec(err.message)?.[1];
+    return res.json({ success: false, error: err.message, ...(replacement ? { deprecated: true, replacement } : {}) });
+  }
 });
 
 app.post('/api/debate', (req, res) => {

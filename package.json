@@ -1,18 +1,20 @@
 {
   "name": "llm-arena",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "test": "node scripts/retry-e2e-test.cjs"
+    "test": "node scripts/retry-e2e-test.cjs && node scripts/experiment-e2e-test.cjs && node scripts/provider-e2e-test.cjs",
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Local multi-model debate arena with anonymous discussion, voting and ranking experiments",
   "dependencies": {
     "cors": "^2.8.6",
-    "express": "^5.2.1",
-    "openai": "^6.46.0",
-    "uuid": "^14.0.1"
+    "express": "^5.2.1"
   }
 }
