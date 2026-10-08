@@ -1,13 +1,15 @@
 {
   "name": "llm-arena",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "src/server.js",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test": "node scripts/retry-e2e-test.cjs && node scripts/experiment-e2e-test.cjs && node scripts/provider-e2e-test.cjs",
-    "start": "node server.js"
+    "test": "node tests/reciprocal-protocol-test.cjs && node tests/ranking-summary-test.cjs && node tests/retry-e2e-test.cjs && node tests/experiment-e2e-test.cjs && node tests/provider-e2e-test.cjs",
+    "start": "node src/server.js",
+    "report": "node scripts/rebuild-ranking-summary.cjs",
+    "tally": "node scripts/tally.cjs"
   },
   "keywords": [],
   "author": "",

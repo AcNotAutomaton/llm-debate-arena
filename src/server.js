@@ -3,8 +3,10 @@ const cors = require('cors');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const experimentProtocol = require('./experiment-protocol.cjs');
-const providerProtocol = require('./provider-protocol.cjs');
+const { updateRankingSummary } = require('./reports/ranking-summary.cjs');
+const experimentProtocol = require('./protocols/experiment-protocol.cjs');
+const providerProtocol = require('./protocols/provider-protocol.cjs');
+const projectRoot = path.resolve(__dirname, '..');
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
 const GLM_BASE_URL = 'https://open.bigmodel.cn/api/coding/paas/v4';
 const OPENCODE_BASE_URL = 'https://opencode.ai/zen/go/v1';
@@ -12,27 +14,83 @@ const OPENCODE_BASE_URL = 'https://opencode.ai/zen/go/v1';
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(projectRoot, 'public')));
 
 const sessions = new Map();
 const sseClients = new Map();
 const experiments = new Map();
+// 临时查看上游流，不写入实验 JSON、辩论历史或 Markdown。
+const experimentChats = new WeakMap();
+
+function updateExperimentChat(experiment, event, data) {
+  const chat = experimentChats.get(experiment);
+  if (!chat) return;
+  if (event === 'debate-end') {
+    for (const message of chat.messages) {
+      if (!['completed', 'failed'].includes(message.state)) {
+        message.state = data.aborted ? 'failed' : 'completed';
+      }
+    }
+    return;
+  }
+  if (!data.model || !['model-start', 'model-token', 'model-done', 'model-evaluation', 'model-retry', 'model-error', 'model-interrupt', 'model-truncation'].includes(event)) return;
+  const round = data.round ?? (event === 'model-evaluation' ? chat.messages.findLast(item => item.model === data.model && typeof item.round === 'string')?.round : null) ?? 'eval';
+  if (event === 'model-start') {
+    for (const previous of chat.messages) {
+      if (previous.model === data.model && previous.round !== round && !['completed', 'failed'].includes(previous.state)) previous.state = 'completed';
+    }
+  }
+  let message = chat.messages.find(item => item.model === data.model && item.round === round);
+  if (!message) {
+    message = { model: data.model, round, phase: data.phase || '', partner: data.partner || '', reasoning: '', text: '', state: 'waiting', startedAt: Date.now(), lastTokenAt: null, notice: '' };
+    chat.messages.push(message);
+    if (chat.messages.length > 80) chat.messages.shift();
+  }
+  if (event === 'model-token') {
+    const field = data.type === 'reasoning' ? 'reasoning' : 'text';
+    message[field] = (message[field] + data.token).slice(-16000);
+    message.lastTokenAt = Date.now();
+    message.state = field === 'reasoning' ? 'thinking' : 'output';
+    message.notice = '';
+  } else if (event === 'model-done' || event === 'model-evaluation') {
+    if (!message.text) message.text = (data.fullText ?? data.evaluation ?? '').slice(-16000);
+    message.state = event === 'model-evaluation' && !data.winRes ? 'failed' : 'completed';
+  } else if (event === 'model-retry') {
+    if (data.resetStream) {
+      message.reasoning = '';
+      message.text = '';
+      message.startedAt = Date.now();
+      message.lastTokenAt = null;
+    }
+    message.state = 'retrying';
+    message.notice = `${data.delayMs / 1000} 秒后第 ${data.nextAttempt} 次尝试：${data.reason}`;
+  } else if (event === 'model-error') {
+    message.state = 'failed';
+    message.notice = data.error;
+  } else if (event === 'model-interrupt' || event === 'model-truncation') {
+    message.notice = data.reason;
+  }
+}
 
 function emit(debateId, event, data) {
   const session = sessions.get(debateId);
   const experiment = session?.experimentId ? experiments.get(session.experimentId) : null;
   const current = experiment?.current;
   if (current && current.debateId === debateId) {
+    // 正文直接从上游原始流更新；常规 SSE 可能缓冲或过滤正文，不能重复累计。
+    if (event !== 'model-token' || data.type === 'reasoning') updateExperimentChat(experiment, event, data);
     if (event === 'round-start') {
       current.step = data.turn;
       current.model = data.model;
       current.phase = data.phase || '讨论中';
+      current.partner = data.partner || '';
       current.text = '';
-    } else if (event === 'model-token' && data.type !== 'reasoning') {
+    } else if (event === 'model-token' && data.type !== 'reasoning' && typeof data.round === 'number') {
       current.text = (current.text + data.token).slice(-8000);
     } else if (event === 'model-done') {
       current.text = (data.fullText || '').slice(-8000);
-      current.speeches.push({ step: data.round, model: data.model, text: (data.fullText || '').slice(0, 12000) });
+      if (data.phase) current.phase = data.phase;
+      current.speeches.push({ step: data.round, model: data.model, phase: data.phase || current.phase, partner: current.partner, text: (data.fullText || '').slice(0, 12000) });
     } else if (event === 'model-eval-start') {
       current.phase = '模型互评中';
       current.model = '';
@@ -41,6 +99,7 @@ function emit(debateId, event, data) {
       current.evaluations.push({ model: data.model, winRes: data.winRes || null });
     } else if (event === 'model-retry') {
       current.phase = `${data.model} 自动重试中`;
+      if (data.resetStream) current.text = '';
     } else if (event === 'model-error') {
       current.phase = '调用失败';
       current.error = data.error;
@@ -75,7 +134,8 @@ function isReasoningModel(modelId) {
   const id = (modelId || '').toLowerCase();
   // glm-4.6 及以上版本（4.6/4.7/4.8/4.9）均带推理能力，4.5 及以下不带
   // qwen3 的 max/flash 档为混合推理型号（互评时会先输出长独白再给结论），plus 档未观察到思考行为
-  return /^(glm-5|glm-4\.[6-9]|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|qwen3\.\d+-(max|flash)|.*-r1|.*-thinking|.*-reasoner|.*-air|minimax-m)/i.test(id)
+  // Kimi 互评也可能先消耗预算进行推理，按推理模型预留输出空间。
+  return /^(kimi|glm-5|glm-4\.[6-9]|deepseek-v4-pro|deepseek-r|deepseek-reason|qwq|o1|o3|o4|qwen3\.\d+-(max|flash)|.*-r1|.*-thinking|.*-reasoner|.*-air|minimax-m)/i.test(id)
       || /thinking|reasoning|reasoner|qwq|o1-|o3-|o4-|-r1$|-air$/i.test(id);
 }
 function effectiveMaxTokens(modelId, userMax) {
@@ -84,15 +144,15 @@ function effectiveMaxTokens(modelId, userMax) {
 
 // 统一流式读取器：处理 SSE 拆包、reasoning/content 分流，
 // 并实现三项健壮性保障：
-//   A) 单 token 间隔超时（默认 120s 无新数据即中止）
+//   A) 单 token 间隔超时（默认 300s 无新数据即中止）
 //   B) [DONE] 是否真实接收过；若流结束但未收到 [DONE] 视为异常中断
 //   C) 读取 finish_reason，识别 length/最大 token 截断
 // 返回 { text, finishReason, doneSeen, interrupted, interruptedReason }
 const READSTREAM_TIMEOUT_MS = 300000;
 // fetch 握手阶段超时：上游长时间不返回响应头时中止，避免"一直思考中"卡死整个辩论
 const FETCH_HANDSHAKE_TIMEOUT_MS = 120000;
-// 瞬时上游故障自动重试：仅覆盖「尚未流出任何 token」的阶段（连接失败 / HTTP 408/429/5xx）。
-// 流已开始后的中断不重试，避免同一次发言的 token 在前端被重复渲染。
+// 瞬时故障重试：连接失败 / HTTP 408/429/5xx，以及尚无正文的流断线。
+// 已收到正文后中断则保留部分内容并停止，不能重试后拼接成重复回答。
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
 const MODEL_FETCH_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 2000;
@@ -128,34 +188,34 @@ async function fetchWithHandshakeTimeout(url, options, timeoutMs) {
   }
 }
 
-async function delayModelRetry(attempt, debateId, modelName, round, reason) {
+async function delayModelRetry(attempt, debateId, modelName, round, reason, resetStream = false) {
   const delayMs = RETRY_BASE_DELAY_MS * (attempt + 1);
   emit(debateId, 'model-retry', {
     model: modelName, round,
     nextAttempt: attempt + 2, delayMs,
-    reason: String(reason || '').slice(0, 160)
+    reason: String(reason || '').slice(0, 160), resetStream
   });
   await new Promise(r => setTimeout(r, delayMs));
 }
 
 // 模型调用统一的重试封装：非瞬时错误直接放行/上抛；
 // 重试耗尽后把最后一次响应原样交还调用方，保留原有错误信息格式。
-async function fetchWithRetry(url, options, debateId, modelName, round) {
-  for (let attempt = 0; ; attempt++) {
+async function fetchWithRetry(url, options, debateId, modelName, round, retryState = { used: 0 }) {
+  for (;;) {
     let resp;
     try {
       resp = await fetchWithHandshakeTimeout(url, options);
     } catch (err) {
-      // 握手超时默认 300s，再等一轮代价太高，直接上抛
+      // 握手超时默认 120s，再等一轮代价太高，直接上抛。
       const msg = (err && err.message) || '';
-      if (attempt >= MODEL_FETCH_RETRIES || msg.includes('未收到响应')) throw err;
-      await delayModelRetry(attempt, debateId, modelName, round, msg);
+      if (retryState.used >= MODEL_FETCH_RETRIES || msg.includes('未收到响应') || msg.includes('handshake-timeout')) throw err;
+      await delayModelRetry(retryState.used++, debateId, modelName, round, msg);
       continue;
     }
-    if (!RETRYABLE_STATUS.has(resp.status) || attempt >= MODEL_FETCH_RETRIES) return resp;
+    if (!RETRYABLE_STATUS.has(resp.status) || retryState.used >= MODEL_FETCH_RETRIES) return resp;
     const status = resp.status;
     const snippet = (await resp.text().catch(() => '')).slice(0, 160);
-    await delayModelRetry(attempt, debateId, modelName, round, `HTTP ${status} ${snippet}`);
+    await delayModelRetry(retryState.used++, debateId, modelName, round, `HTTP ${status} ${snippet}`);
   }
 }
 
@@ -164,6 +224,8 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
     const data = await parseProviderResponse(resp);
     const text = providerProtocol.responseText(data, isAnthropic ? 'anthropic' : isResponses ? 'responses' : 'chat');
     if (!text.trim()) throw new Error('上游返回空正文，请检查模型权限或输出 token 预算');
+    const liveExperiment = experiments.get(sessions.get(debateId)?.experimentId);
+    if (liveExperiment) updateExperimentChat(liveExperiment, 'model-token', { model: modelName, round, token: text });
     emit(debateId, 'model-token', { model: modelName, round, token: text });
     return { text, doneSeen: true, interrupted: false, truncatedByToken: data.status === 'incomplete' || data.stop_reason === 'max_tokens' || data.choices?.[0]?.finish_reason === 'length' };
   }
@@ -194,6 +256,7 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
   const watcher = watchIdle().catch(() => {});
   let streamFinished = false; // 上游已通过 finish_reason 声明生成完毕
   let streamError = null; // 连接异常（如 terminated）
+  let transportError = false;
   while (true) {
     if (interrupted || streamFinished) break;
     let chunk;
@@ -201,6 +264,7 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
       chunk = await reader.read();
     } catch (readErr) {
       streamError = readErr;
+      transportError = true;
       break;
     }
     const { done, value } = chunk;
@@ -264,6 +328,8 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
       if (reasonTok) { reasoning += reasonTok; lastTokenTs = Date.now(); emit(debateId, 'model-token', { model: modelName, round, token: reasonTok, type: 'reasoning' }); }
       // —— 共享：content token 处理 + think-leak 实时检测 ——
       if (tok) {
+          const liveExperiment = experiments.get(sessions.get(debateId)?.experimentId);
+          if (liveExperiment) updateExperimentChat(liveExperiment, 'model-token', { model: modelName, round, token: tok });
           full += tok;
           lastTokenTs = Date.now();
           if (!thinkLeakChecked) {
@@ -297,7 +363,6 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
   if (streamFinished) { try { reader.cancel().catch(() => {}); } catch {} }
   readerEnded = true;
   await watcher;
-  if (streamError && !full) throw streamError;
   // 兜底：剥离模型把思考过程泄漏到 content（而非 reasoning_content）的情况。
   // 三种已知形态：
   //   1) <think>...</think> 标签包裹（minimax-m3 等），含被 max_tokens 截断的孤立  起始标签
@@ -400,12 +465,50 @@ async function readStream(resp, debateId, modelName, round, isAnthropic, isRespo
     interrupted = true;
     interruptedReason = '连接被服务端中断（' + (streamError.message || 'terminated') + '）';
   }
+  if (streamError || interrupted || !doneSeen) {
+    const error = new Error(interruptedReason || streamError?.message || '数据流提前结束，未收到完成标记');
+    error.retryableStream = !full && !interruptedReason.startsWith('超过 ') && (transportError || (!streamError && !doneSeen));
+    error.streamInterrupted = true;
+    error.partialText = cleaned;
+    throw error;
+  }
   return {
     text: cleaned || reasoning,
     finishReason, doneSeen, interrupted, interruptedReason,
     // OpenAI 协议截断时 finish_reason 为 'length'，Anthropic 协议 stop_reason 为 'max_tokens'
     truncatedByToken: finishReason === 'length' || finishReason === 'max_tokens'
   };
+}
+
+// 握手/HTTP 错误和流断线共用同一个重试预算，避免嵌套重试。
+async function requestModelText(request, debateId, modelName, round, errorLabel) {
+  const retryState = { used: 0 };
+  for (;;) {
+    const resp = await fetchWithRetry(request.url, request.options, debateId, modelName, round, retryState);
+    if (!resp.ok) {
+      if (errorLabel) throw new Error(`${errorLabel} 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
+      await parseProviderResponse(resp);
+    }
+    try {
+      const result = await readStream(resp, debateId, modelName, round, request.protocol === 'anthropic', request.protocol === 'responses');
+      // 互评的预算截断与网络断线不同：上层可提高预算重新评选，不能采用残缺投票。
+      if ((round === 'eval' || round === 'eval-retry') && result.truncatedByToken) {
+        const error = new Error('互评已达输出 Token 上限');
+        error.evaluationTruncated = true;
+        error.partialText = annotateStreamResult(debateId, modelName, round, result);
+        throw error;
+      }
+      if (!result.text.trim()) {
+        const error = new Error('模型返回空正文，请检查输出 token 预算或上游模型状态');
+        error.code = 'EMPTY_MODEL_TEXT';
+        throw error;
+      }
+      return annotateStreamResult(debateId, modelName, round, result);
+    } catch (error) {
+      if (!error.retryableStream || retryState.used >= MODEL_FETCH_RETRIES) throw error;
+      await delayModelRetry(retryState.used++, debateId, modelName, round, `连接中断且尚无正文：${error.message}`, true);
+    }
+  }
 }
 
 // 把 readStream 的诊断结果通过 SSE 反馈给前端，并追加到返回文本末尾作为标记
@@ -457,19 +560,13 @@ function buildUserPrompt(question, identifier, history, anonymous) {
 async function callDeepSeek(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || DEEPSEEK_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
-  if (!resp.ok) throw new Error(`DeepSeek 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round, false);
-  return annotateStreamResult(debateId, modelName, round, r);
+  return requestModelText({ url, options: { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, protocol: 'chat' }, debateId, modelName, round, 'DeepSeek');
 }
 
 async function callGLM(baseUrl, apiKey, modelId, messages, temperature, maxTokens, debateId, modelName, round) {
   const url = `${(baseUrl || GLM_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
   const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` };
-  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, debateId, modelName, round);
-  if (!resp.ok) throw new Error(`GLM 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round, false);
-  return annotateStreamResult(debateId, modelName, round, r);
+  return requestModelText({ url, options: { method: 'POST', headers, body: JSON.stringify({ model: modelId, messages, temperature, max_tokens: maxTokens, stream: true }) }, protocol: 'chat' }, debateId, modelName, round, 'GLM');
 }
 
 // OpenCode 必需头：每个对话一个稳定会话 ID，用于路由优化与 prompt 缓存；
@@ -510,10 +607,7 @@ async function callAnthropic(baseUrl, apiKey, modelId, messages, temperature, ma
     stream: true
   };
   if (systemContent) body.system = systemContent;
-  const resp = await fetchWithRetry(url, { method: 'POST', headers, body: JSON.stringify(body) }, debateId, modelName, round);
-  if (!resp.ok) throw new Error(`OpenCode(Anthropic) 错误 (${resp.status}): ${await resp.text().catch(() => '')}`);
-  const r = await readStream(resp, debateId, modelName, round, true);
-  return annotateStreamResult(debateId, modelName, round, r);
+  return requestModelText({ url, options: { method: 'POST', headers, body: JSON.stringify(body) }, protocol: 'anthropic' }, debateId, modelName, round, 'OpenCode(Anthropic)');
 }
 
 function getModelCallConfig(model) {
@@ -540,11 +634,7 @@ async function callModel(config, modelId, messages, temperature, maxTokens, deba
   }
   if (config.provider === 'opencode') {
     const request = providerProtocol.requestFor(config.provider, config.baseUrl, config.apiKey, modelId, messages, temperature, maxTokens, true, opencodeSession([debateId, modelName || modelId]));
-    const resp = await fetchWithRetry(request.url, request.options, debateId, modelName, round);
-    if (!resp.ok) await parseProviderResponse(resp);
-    const result = await readStream(resp, debateId, modelName, round, request.protocol === 'anthropic', request.protocol === 'responses');
-    if (!result.text.trim()) throw new Error('模型返回空正文，请检查输出 token 预算或上游模型状态');
-    return annotateStreamResult(debateId, modelName, round, result);
+    return requestModelText(request, debateId, modelName, round);
   }
   throw new Error(`不支持的模型 Provider: ${config.provider || '未指定'}`);
 }
@@ -605,6 +695,7 @@ async function evaluateModels(debateId, session) {
     var _e = session.history[_i];
     var who = anonymous ? _e.label : _e.model;
     transcript += who + "（第" + _e.step + "步）:\n" + _e.content + "\n\n";
+    if (_e.phase) transcript += `【${_e.phase}；对话对象：${_e.partner}】\n\n`;
   }
   session.evaluations = [];
   // 候选标识列表：匿名用「参与者X」，实名用真实模型名
@@ -623,17 +714,29 @@ async function evaluateModels(debateId, session) {
       sysContent = "你是 " + model.name + "，你刚刚参加了一场多模型辩论。请基于辩论记录，用中文简短评价每个模型的表现（包括你自己），最后投票评出胜者。控制在200字以内。\n\n重要要求：\n1. 不要输出思考过程、内部独白或任何 <think> 标签内容——直接给出最终评价。\n2. 不要逐条复述辩论内容，直接给出你的评价结论。\n3. 必须确保最后能输出「win_res：胜者标识」这一行，这是最关键的。" + fmtRule;
       userContent = "辩论问题：" + session.question + "\n\n完整辩论记录：\n" + transcript + "\n\n请直接给出每个模型的评价结论（不要思考过程、不要复述辩论），并在最后一行用「win_res：胜者标识」投票评出胜者。";
     }
-    if (session.protocol) sysContent += '\n\n实验统一评价规则：' + experimentProtocol.rubric;
+    if (session.protocol) {
+      sysContent = `你是${myId}，现在进行最终互评。所有候选者回答的是同一个用户问题。逐个评价候选者，包括自己；为每人引用至少一处具体回答步骤，主要比较正确性、完整性、相关性和论证依据，选出回答最好者。区分真实错误、合理补充和待核验争议，不照搬回答中的能力判断。不要虚构工具验证，正文控制在800字以内。\n实验统一评价规则：${session.rubric || experimentProtocol.rubric}` + fmtRule;
+    }
     var msgs = [
       { role: "system", content: sysContent },
       { role: "user", content: userContent }
     ];
     var callConfig = getModelCallConfig(model);
     // 互评阶段也需要对推理模型放大 max_tokens——思考过程同样会吃光预算
-    var effMax = effectiveMaxTokens(model.id, 512);
-    var retryDone = false;
+    var effMax = effectiveMaxTokens(model.id, 2048);
+    var text = '';
+    async function requestEvaluation(messages, budget, round) {
+      try {
+        return { text: await callModel(callConfig, model.id, messages, 0.3, budget, debateId, model.name, round), truncated: false };
+      } catch (error) {
+        if (!error.evaluationTruncated && error.code !== 'EMPTY_MODEL_TEXT') throw error;
+        return { text: error.partialText || '', truncated: !!error.evaluationTruncated };
+      }
+    }
+    if (session.experimentId) emit(debateId, 'model-start', { model: model.name, round: 'eval' });
     try {
-      var text = await callModel(callConfig, model.id, msgs, 0.3, effMax, debateId, model.name, "eval");
+      var result = await requestEvaluation(msgs, effMax, 'eval');
+      text = result.text;
       // 兜底重试：若返回为空（思考泄漏被全部剥光）或没抠到 win_res，
       // 用更短更强制的提示再要一次。这种情况常见于推理模型把预算花在思考、
       // 或把思考伪装成正文写到 content 被 readStream 清理掉后剩空。
@@ -648,26 +751,39 @@ async function evaluateModels(debateId, session) {
         raw = raw.replace(/^参与者\s+([A-Z])/, '参与者$1');
         // 截到首个标点为止（防止「参与者B。中文冒号？」这类尾随内容）
         raw = raw.replace(/[，。？！,;；].*$/, '').trim();
-        return raw;
+        return candidates.includes(raw) ? raw : '';
       }
-      var winRes = extractWinRes(text);
-      if ((!text || !winRes) && !retryDone) {
-        retryDone = true;
+      var winRes = result.truncated ? '' : extractWinRes(text);
+      if (!winRes) {
         var retrySys = "只做一件事：直接输出最终投票，不要任何思考、分析、编号列表或  标签。控制在 80 字以内，最后一行严格为「win_res：胜者标识」。胜者标识只能从这些候选中选一个：" + candidates.join("、") + "。";
         if (session.protocol) retrySys += '\n' + experimentProtocol.rubric;
         var retryUser = "辩论问题：" + session.question + "\n\n辩论记录（简版，仅标识）：\n" + transcript + "\n\n直接给出最终投票，最后一行必须是「win_res：胜者标识」。";
         var retryMsgs = [ { role: "system", content: retrySys }, { role: "user", content: retryUser } ];
-        var retryText = await callModel(callConfig, model.id, retryMsgs, 0.3, effMax, debateId, model.name, "eval-retry");
-        if (retryText) text = retryText;
-        winRes = extractWinRes(text);
+        if (session.experimentId) emit(debateId, 'model-start', { model: model.name, round: 'eval-retry' });
+        var retryBudget = Math.min(effMax * 2, 65536);
+        var retryResult = await requestEvaluation(retryMsgs, retryBudget, 'eval-retry');
+        winRes = retryResult.truncated ? '' : extractWinRes(retryResult.text);
+        if (winRes) {
+          text = retryResult.text;
+        } else {
+          text += '\n\n**提高预算后重新互评仍失败**：\n\n' + retryResult.text;
+          const error = new Error('提高输出预算后仍未取得完整有效投票；停止实验，避免缺票排名');
+          error.partialText = text;
+          throw error;
+        }
       }
-      // 校验：winRes 必须是候选之一，否则置空
-      if (winRes && candidates.indexOf(winRes) < 0) winRes = "";
       session.evaluations.push({ model: model.name, evaluation: text, winRes: winRes });
       emit(debateId, "model-evaluation", { model: model.name, evaluation: text, winRes: winRes });
     } catch (err) {
-      session.evaluations.push({ model: model.name, evaluation: "评价失败: " + err.message, winRes: "" });
-      emit(debateId, "model-evaluation", { model: model.name, evaluation: "评价失败: " + err.message, winRes: "" });
+      const evaluation = ((err.partialText || text) ? (err.partialText || text) + '\n\n' : '') + "评价失败: " + err.message;
+      session.evaluations.push({ model: model.name, evaluation, winRes: "" });
+      emit(debateId, "model-evaluation", { model: model.name, evaluation, winRes: "" });
+      if (err.streamInterrupted || session.experimentId) {
+        session.aborted = true;
+        session.evaluationError = err.message;
+        emit(debateId, 'model-error', { model: model.name, round: 'eval', error: err.message, partialText: err.partialText || '' });
+        throw err;
+      }
     }
   }
 }
@@ -681,7 +797,7 @@ async function startDebate(debateId) {
   // 为每个参与方分配一个中立标识（参与者A、参与者B…），匿名模式下用其替代真实模型名，避免泄露身份
   s.labels = s.models.map(function (_, i) { return '参与者' + String.fromCharCode(65 + i); });
   const anonymous = s.anonymous !== false;
-  const totalSteps = (s.rounds + (s.protocol ? 1 : 0)) * s.models.length;
+  const totalSteps = s.protocol ? experimentProtocol.totalSteps(s.rounds, s.models.length) : s.rounds * s.models.length;
   emit(debateId, 'debate-start', { question: s.question, models: s.models, totalSteps: totalSteps, anonymous: anonymous });
   for (let step = 0; step < totalSteps; step++) {
     const modelIdx = step % s.models.length;
@@ -689,24 +805,27 @@ async function startDebate(debateId) {
     const currentLabel = s.labels[modelIdx];
     const identifier = anonymous ? currentLabel : model.name;
     const turnNum = step + 1;
-    const phase = s.protocol ? (step < s.models.length ? '独立回答' : `讨论第 ${Math.floor(step / s.models.length)} 轮`) : '讨论中';
-    emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name, phase });
-    const visibleHistory = s.protocol ? experimentProtocol.historyForTurn(s.history, step, s.models.length) : s.history;
-    const msgs = [
-      { role: 'system', content: s.protocol ? experimentProtocol.systemPrompt(identifier, step < s.models.length, s.wordLimit) : buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
-      { role: 'user', content: buildUserPrompt(s.question, identifier, visibleHistory, anonymous) }
+    const turn = s.protocol ? experimentProtocol.turnFor(step, s.models.length) : null;
+    const phase = turn?.phase || '讨论中';
+    const partner = turn?.partnerIndex != null ? s.labels[turn.partnerIndex] : '';
+    emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name, phase, partner });
+    const msgs = turn ? experimentProtocol.messagesFor(s.question, s.labels, s.history, turn, s.wordLimit) : [
+      { role: 'system', content: buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
+      { role: 'user', content: buildUserPrompt(s.question, identifier, s.history, anonymous) }
     ];
-    emit(debateId, 'model-start', { model: model.name, round: turnNum });
+    emit(debateId, 'model-start', { model: model.name, round: turnNum, phase, partner });
     const callConfig = getModelCallConfig(model);
     // 推理模型自动放大 max_tokens（思考过程需要），非推理模型沿用用户的设置值
     const effMax = effectiveMaxTokens(model.id, s.maxTokens);
     try {
       const text = await callModel(callConfig, model.id, msgs, s.temperature, effMax, debateId, model.name, turnNum);
-      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: text });
-      emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text });
+      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: text,
+        ...(turn ? { exchangeRound: turn.exchangeRound, kind: turn.kind, phase, partner } : {}) });
+      emit(debateId, 'model-done', { model: model.name, round: turnNum, fullText: text, phase, partner });
     } catch (err) {
-      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
-      emit(debateId, 'model-error', { model: model.name, round: turnNum, error: err.message });
+      const partial = err.partialText || '';
+      s.history.push({ model: model.name, label: currentLabel, step: turnNum, content: (partial ? partial + '\n\n' : '') + '[' + model.name + '] \u751f\u6210\u5931\u8d25: ' + err.message });
+      emit(debateId, 'model-error', { model: model.name, round: turnNum, error: err.message, partialText: partial });
       s.aborted = true;
       break;
     }
@@ -720,7 +839,10 @@ async function startDebate(debateId) {
     try {
       await evaluateModels(debateId, s);
     } catch (e) { console.error('Eval failed:', e.message); }
-    if (s.skipJudge) {
+    if (s.aborted) {
+      s.status = 'aborted';
+      emit(debateId, 'debate-end', { aborted: true, errorMessage: s.evaluations.at(-1)?.evaluation || '互评中断' });
+    } else if (s.skipJudge) {
       emit(debateId, 'debate-end', { judgeText: '', scores: {}, winner: '', evaluations: s.evaluations || [] });
     } else {
       try {
@@ -732,7 +854,7 @@ async function startDebate(debateId) {
     }
   }
   try {
-    const dir = require('path').join(__dirname, 'debates');
+    const dir = path.join(projectRoot, 'debates');
     if (!require('fs').existsSync(dir)) require('fs').mkdirSync(dir, { recursive: true });
     const now = new Date();
     const filename = now.getFullYear() + '-' +
@@ -745,8 +867,10 @@ async function startDebate(debateId) {
     if (s.aborted) md += '**状态**: ❌ 辩论因错误中断\n\n';
     md += '**\u95ee\u9898**: ' + s.question + '\n\n';
     md += '**\u53c2\u4e0e\u6a21\u578b**: ' + s.models.map(m => m.name).join(', ') + '\n\n---\n\n';
+    if (s.protocol) md += `**实验协议**: ${s.protocol}\n\n**评价规则**: ${s.rubric || experimentProtocol.rubric}\n\n---\n\n`;
     for (let i = 0; i < s.history.length; i++) {
       md += '## \u7b2c' + (i+1) + '\u6b65 - ' + s.history[i].model + '\n\n';
+      if (s.history[i].phase) md += `**环节**: ${s.history[i].phase}${s.history[i].partner ? '；**对话对象**: ' + s.history[i].partner : ''}\n\n`;
       md += s.history[i].content + '\n\n---\n\n';
     }
     if (s.evaluations && s.evaluations.length > 0) {
@@ -764,9 +888,13 @@ async function startDebate(debateId) {
 }
 
 function saveExperiment(experiment) {
-  const dir = path.join(__dirname, 'experiments');
+  const dir = path.join(projectRoot, 'experiments');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, experiment.id + '.json'), JSON.stringify(experiment, null, 2), 'utf8');
+  if (experiment.status === 'completed') {
+    try { updateRankingSummary(); }
+    catch (error) { console.error('排名汇总更新失败:', error.message); }
+  }
 }
 
 async function runExperiment(experiment, models) {
@@ -791,16 +919,17 @@ async function runExperiment(experiment, models) {
             debateId, stage: stageIndex + 1, repeat: repeat + 1, tiebreak, discussionRounds,
             questionIndex: questionIndex + 1, question: experiment.questions[questionIndex],
             speakerOrder: orderedModels.map(m => m.name), step: 0,
-            totalSteps: (discussionRounds + 1) * orderedModels.length,
+            totalSteps: experimentProtocol.totalSteps(discussionRounds, orderedModels.length),
             model: '', phase: '准备中', text: '', speeches: [], evaluations: []
           };
+          experimentChats.set(experiment, { debateId, messages: [] });
           const session = {
             id: debateId, question: experiment.questions[questionIndex], models: orderedModels,
             rounds: discussionRounds, temperature: experiment.temperature,
             maxTokens: experiment.maxTokens, anonymous: experiment.anonymous,
             status: 'pending', history: [], evaluations: [], createdAt: Date.now(),
             captureEvents: false, skipJudge: true, experimentId: experiment.id,
-            protocol: experiment.protocol, wordLimit: experiment.wordLimit
+            protocol: experiment.protocol, wordLimit: experiment.wordLimit, rubric: experiment.rubric
           };
           sessions.set(debateId, session);
           sseClients.set(debateId, new Set());
@@ -811,7 +940,7 @@ async function runExperiment(experiment, models) {
             sessions.delete(debateId);
             sseClients.delete(debateId);
           }
-          if (finished.aborted) throw new Error(`第 ${stageIndex + 1} 阶段第 ${repeat + 1} 次，辩题 ${questionIndex + 1} 的辩论中断；已保留之前的结果`);
+          if (finished.aborted) throw new Error(`第 ${stageIndex + 1} 阶段第 ${repeat + 1} 次，辩题 ${questionIndex + 1} 的辩论中断；已保留之前的结果${finished.evaluationError ? '：' + finished.evaluationError : ''}`);
           const votes = {};
           for (const model of remaining) votes[model.name] = 0;
           const individualVotes = (finished.evaluations || []).map(ev => {
@@ -823,7 +952,8 @@ async function runExperiment(experiment, models) {
             if (chosen) { votes[chosen]++; stage.votes[chosen]++; }
             return { voter: ev.model, chosen: chosen || null };
           });
-          stage.runs.push({ debateId, recordFile: finished.recordFile || null, questionIndex: questionIndex + 1, repeat: repeat + 1, tiebreak, discussionRounds, speakerOrder: orderedModels.map(m => m.name), votes, individualVotes });
+          stage.runs.push({ debateId, recordFile: finished.recordFile || null, questionIndex: questionIndex + 1, repeat: repeat + 1, tiebreak, discussionRounds, speakerOrder: orderedModels.map(m => m.name), votes, individualVotes,
+            exchanges: finished.history.map(entry => ({ step: entry.step, model: entry.model, label: entry.label, round: entry.exchangeRound, kind: entry.kind, phase: entry.phase, partner: entry.partner })) });
           experiment.completedDebates++;
           experiment.updatedAt = new Date().toISOString();
           saveExperiment(experiment);
@@ -866,7 +996,7 @@ async function runExperiment(experiment, models) {
 }
 
 app.post('/api/experiments', (req, res) => {
-  const { models, questions, repetitions = 1, rounds = 2, temperature = 0.7, maxTokens = 2048, wordLimit = 600 } = req.body;
+  const { models, questions, repetitions = 1, rounds = 1, temperature = 0.7, maxTokens = 2048, wordLimit = 600 } = req.body;
   const names = Array.isArray(models) ? models.map(m => m.name) : [];
   if (names.length < 2 || names.length > 4 || new Set(names).size !== names.length ||
       models.some(m => !m.id || !['deepseek', 'glm', 'opencode'].includes(m.provider))) {
@@ -888,7 +1018,7 @@ app.post('/api/experiments', (req, res) => {
     id, status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     models: models.map(m => ({ id: m.id, name: m.name, provider: m.provider })),
     questions: questions.map(q => q.trim()), repetitions, rounds, temperature, maxTokens,
-    anonymous: true, protocol: 'prompt-discussion-v4', wordLimit, rubric: experimentProtocol.rubric,
+    anonymous: true, protocol: experimentProtocol.protocol, wordLimit, rubric: experimentProtocol.rubric,
     totalDebates: questions.length * repetitions * (names.length - 1),
     completedDebates: 0, stages: [], ranking: []
   };
@@ -899,7 +1029,7 @@ app.post('/api/experiments', (req, res) => {
 });
 
 app.get('/api/experiments', (req, res) => {
-  const dir = path.join(__dirname, 'experiments');
+  const dir = path.join(projectRoot, 'experiments');
   const items = [];
   if (fs.existsSync(dir)) for (const name of fs.readdirSync(dir)) {
     if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
@@ -915,7 +1045,7 @@ app.get('/api/experiments', (req, res) => {
 app.get('/api/experiments/:id', (req, res) => {
   let experiment = experiments.get(req.params.id);
   if (!experiment && /^[0-9a-f-]{36}$/.test(req.params.id)) {
-    const file = path.join(__dirname, 'experiments', req.params.id + '.json');
+    const file = path.join(projectRoot, 'experiments', req.params.id + '.json');
     if (fs.existsSync(file)) {
       experiment = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (['pending', 'running'].includes(experiment.status)) {
@@ -925,7 +1055,7 @@ app.get('/api/experiments/:id', (req, res) => {
     }
   }
   if (!experiment) return res.status(404).json({ error: '实验不存在' });
-  res.json(experiment);
+  res.json({ ...experiment, liveChat: experimentChats.get(experiment) || null });
 });
 
 app.get('/api/debate-records/:filename', (req, res) => {
@@ -933,7 +1063,7 @@ app.get('/api/debate-records/:filename', (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-[0-9a-f]{8}\.md$/.test(filename)) {
     return res.status(400).send('无效的记录文件名');
   }
-  const file = path.join(__dirname, 'debates', filename);
+  const file = path.join(projectRoot, 'debates', filename);
   if (!fs.existsSync(file)) return res.status(404).send('记录不存在');
   res.type('text/plain; charset=utf-8').sendFile(file);
 });
@@ -1033,6 +1163,8 @@ app.get('/api/debate/:id/stream', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3456;
+try { updateRankingSummary(); }
+catch (error) { console.error('排名汇总更新失败:', error.message); }
 app.listen(PORT, () => {
   console.log(`🎯 LLM \u8fa9\u8bba\u7ade\u6280\u573a\u5df2\u542f\u52a8\uff01`);
   console.log(`   \u672c\u5730\u8bbf\u95ee: http://localhost:${PORT}`);

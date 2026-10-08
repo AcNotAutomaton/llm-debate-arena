@@ -3,7 +3,8 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { requestFor } = require('../provider-protocol.cjs');
+const { requestFor } = require('../src/protocols/provider-protocol.cjs');
+const { updateRankingSummary } = require('../src/reports/ranking-summary.cjs');
 const root = path.join(__dirname, '..');
 const question = 'provider-e2e: 请修复前端错误';
 let result, experimentId;
@@ -55,7 +56,7 @@ const mock = http.createServer((req, res) => {
   const baseUrl = `http://127.0.0.1:${mock.address().port}/v1`;
   const port = 4569;
   const base = `http://127.0.0.1:${port}`;
-  const arena = spawn(process.execPath, ['server.js'], { cwd: root, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' });
+  const arena = spawn(process.execPath, ['src/server.js'], { cwd: root, env: { ...process.env, PORT: String(port) }, stdio: 'ignore' });
   try {
     let ready = false;
     for (let i = 0; i < 60; i++) {
@@ -98,5 +99,6 @@ const mock = http.createServer((req, res) => {
       const file = path.join(root, 'debates', run.recordFile);
       if (fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes(question)) fs.unlinkSync(file);
     }
+    updateRankingSummary(root);
   }
 })().catch(err => { console.error(err); process.exitCode = 1; });

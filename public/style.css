@@ -360,14 +360,22 @@ h1 { font-size: 22px; font-weight: 700; background: linear-gradient(135deg, #818
 summary { cursor: pointer; }
 .debug-parameters { display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 20px; }
 .debug-parameters input[type="number"] { max-width: 100px; }
-#experimentMonitor { display: flex; flex-direction: column; }
+#experimentMonitor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 0.85fr); gap: 16px; align-items: start; }
+#experimentMonitor[data-chat="false"] { grid-template-columns: minmax(0, 1fr); }
 #experimentStatus { padding: 14px; border-radius: 8px; background: var(--bg-tertiary); line-height: 1.8; overflow-wrap: anywhere; }
-#experimentResult { order: 1; }
-#experimentLive { order: 2; }
-#experimentMonitor[data-running="true"] { display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 16px; align-items: start; }
-#experimentMonitor[data-running="true"] #experimentStatus { grid-column: 2; grid-row: 1; }
-#experimentMonitor[data-running="true"] #experimentLive { grid-column: 1; grid-row: 1; }
-#experimentMonitor[data-running="true"] #experimentResult { grid-column: 1 / -1; }
+#experimentStatus { grid-column: 1 / -1; }
+#experimentLive { grid-column: 1; grid-row: 2; min-width: 0; }
+#experimentResult { grid-column: 1; grid-row: 3; }
+.experiment-chat { grid-column: 2; grid-row: 2 / span 2; min-width: 0; padding: 14px; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 8px; }
+.experiment-chat > h3 { margin: 0 0 8px; }
+.experiment-chat > .hint-text { line-height: 1.6; margin-bottom: 12px; }
+.experiment-chat-messages { max-height: 65vh; min-height: 180px; overflow: auto; overflow-anchor: none; }
+.experiment-chat-message { padding: 12px; margin-bottom: 12px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-secondary); }
+.experiment-chat-message h4 { margin-bottom: 6px; font-size: 13px; overflow-wrap: anywhere; }
+.experiment-chat-message pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; line-height: 1.7; margin-top: 8px; }
+.chat-status, .chat-reasoning { color: var(--text-secondary); font-size: 12px; }
+.chat-notice { color: #d97706; font-size: 12px; overflow-wrap: anywhere; }
+.experiment-chat-message[data-state="thinking"], .experiment-chat-message[data-state="output"] { border-left: 3px solid #818cf8; }
 #recordsList { display: grid; gap: 10px; max-height: 420px; overflow: auto; }
 .record-card { text-align: left; padding: 16px; border: 1px solid var(--border-color); border-radius: 10px; background: var(--bg-secondary); color: var(--text-primary); cursor: pointer; }
 .record-card:hover, .record-card:focus-visible { border-color: #818cf8; }
@@ -383,8 +391,9 @@ button:focus-visible, summary:focus-visible { outline: 2px solid #818cf8; outlin
   .workspace-nav button { padding: 10px 8px; font-size: 13px; }
   .view-heading { align-items: flex-start; flex-wrap: wrap; }
   #experimentModelPicker .model-list { grid-template-columns: 1fr; }
-  #experimentMonitor[data-running="true"] { display: flex; }
-  #experimentMonitor[data-running="true"] #experimentLive { order: 1; }
-  #experimentMonitor[data-running="true"] #experimentResult { order: 2; }
+  #experimentMonitor { display: flex; flex-direction: column; }
+  #experimentMonitor > * { width: 100%; }
+  #experimentChat { order: 1; }
+  #experimentResult { order: 2; }
   .config-summary { flex-wrap: wrap; gap: 8px; }
 }

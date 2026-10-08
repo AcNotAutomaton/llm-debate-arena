@@ -44,25 +44,31 @@
 
   <section id="experimentView" class="workspace-view">
   <section class="experiment-panel" aria-labelledby="experimentTitle">
-    <div class="view-heading"><div><h2 id="experimentTitle">排名实验</h2><p class="view-description">填写提示词 → 循环辩论 → 得出排名</p></div><button id="newExperimentBtn" class="btn-secondary" type="button" hidden>配置下一组</button></div>
+    <div class="view-heading"><div><h2 id="experimentTitle">排名实验</h2><p class="view-description">同题独立回答 → 匿名互评 → 逐次确定排名</p></div><button id="newExperimentBtn" class="btn-secondary" type="button" hidden>配置下一组</button></div>
     <div id="experimentSetup" class="experiment-setup">
       <div class="view-heading"><p>选择 2–4 个模型。</p><button id="connectModelsBtn" class="btn-secondary" type="button">连接模型</button></div>
       <div id="experimentModelPicker"></div>
       <p id="modelPickerHint" class="hint-text">尚未加载模型，请先连接模型提供方。</p>
-      <label for="experimentQuestions">提示词</label>
-      <textarea id="experimentQuestions" rows="6" maxlength="4000" placeholder="输入完整提示词，模型将围绕它回答、讨论并互评。"></textarea>
+      <label for="experimentQuestions">问题与提示词</label>
+      <textarea id="experimentQuestions" rows="6" maxlength="4000" placeholder="输入同一个问题，所有模型独立回答。例如：HTML 中 async 和 defer 有何区别？请说明执行顺序、对页面加载的影响并给出示例。"></textarea>
       <div class="experiment-fields">
         <label>每阶段循环次数 <input id="experimentRepeats" type="number" min="1" max="10" value="1"></label>
-        <label>每场讨论轮数 <input id="experimentRounds" type="number" min="1" max="10" value="2"></label>
+        <label>每场回答轮数 <input id="experimentRounds" type="number" min="1" max="10" value="1"></label>
       </div>
       <p id="experimentEstimate" class="hint-text">选模型并填写提示词后显示预计场次</p>
-      <p class="hint-text">逐次选出第 1、2、3、4 名（按所选模型数量）。最高票并列时增加讨论轮数加赛，最多 5 次。每场完整讨论自动保存到 debates/ 的 Markdown 文件。</p>
+      <p class="hint-text">所有模型独立回答同一个问题，再匿名互评投票；不互相出题。设为多轮时，从第二轮起参考此前完整轮次的答案补充回答。争议仍需人工核验。</p>
+      <p class="hint-text">选出第一名后，剩余模型围绕同一问题重新比赛，依次选出后续名次。最高票并列时增加回答轮数加赛，最多 5 次。每场回答与互评自动保存到 debates/ 的 Markdown 文件。</p>
       <details id="advancedSettings"><summary>高级设置</summary><div id="advancedParameters" class="experiment-fields"></div></details>
       <button id="startExperimentBtn" class="btn-primary" disabled>开始排名实验</button>
     </div>
     <div id="experimentMonitor" hidden>
     <div id="experimentStatus" class="experiment-status" role="status"></div>
     <div id="experimentLive" class="experiment-live" hidden></div>
+    <aside id="experimentChat" class="experiment-chat" aria-label="模型实时聊天" hidden>
+      <h3>模型实时聊天</h3>
+      <p class="hint-text">显示接口返回的思考和正文。每场切换时清空，不写入记录；接口未返回思考时仅显示正文。</p>
+      <div class="experiment-chat-messages"></div>
+    </aside>
     <div id="experimentResult"></div>
     </div>
   </section>

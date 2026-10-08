@@ -17,6 +17,7 @@
   q('#newExperimentBtn').onclick = () => {
     q('#experimentSetup').hidden = false;
     q('#experimentMonitor').hidden = true;
+    q('#experimentChat').hidden = true;
     q('#newExperimentBtn').hidden = true;
   };
 
@@ -44,7 +45,7 @@
           detail.textContent = '正在读取结果…';
           try {
             const data = await readExperiment(record.id);
-            detail.innerHTML = `<h3>实验详情</h3><p>${escapeHtml(statusLabels[data.status] || data.status)}</p><h3>排名</h3>${data.ranking.length ? '<ol>' + data.ranking.map(name => '<li>' + escapeHtml(name) + '</li>').join('') + '</ol>' : '<p>尚未确定</p>'}`;
+            detail.innerHTML = `<h3>实验详情</h3><p>${escapeHtml(statusLabels[data.status] || data.status)} · ${experimentModeName(data.protocol)}</p><h3>排名</h3>${data.ranking.length ? '<ol>' + data.ranking.map(name => '<li>' + escapeHtml(name) + '</li>').join('') + '</ol>' : '<p>尚未确定</p>'}`;
             if (data.tie) {
               const tie = document.createElement('p');
               tie.textContent = `第 ${data.tie.position} 名并列：${data.tie.models.join('、')}`;
