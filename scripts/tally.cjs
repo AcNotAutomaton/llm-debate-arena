@@ -39,6 +39,7 @@ if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
 function collectMd(d) {
   const out = [];
   for (const name of fs.readdirSync(d)) {
+    if (name === 'order-checks') continue; // 固定答案复评不是新的辩论场次。
     const p = path.join(d, name);
     const st = fs.statSync(p);
     if (st.isDirectory()) out.push(...collectMd(p));
@@ -52,6 +53,7 @@ const files = collectMd(dir);
 // 提取一个文件的投票信息
 function analyzeFile(file) {
   const content = fs.readFileSync(file, 'utf8');
+  if (content.startsWith('# 顺序对照复评报告')) return null;
   const idx = content.indexOf('## 模型互评');
   if (idx < 0) return null; // 无互评段
   const section = content.substring(idx);

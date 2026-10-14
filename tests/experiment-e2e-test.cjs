@@ -13,8 +13,10 @@ const mockBase = `http://127.0.0.1:${mockPort}`;
 const question = '实验端到端测试：请分析岩石风化的影响因素\n===\n这是同一提示词中的分隔线，请结合上文给出可验证的论证。';
 const phaseInputs = { answer: [], supplement: [] };
 const experimentPrompts = [];
+const answerCalls = [];
 const { rubric } = require('../src/protocols/experiment-protocol.cjs');
 const tieMode = process.env.TEST_TIE || '';
+const orderPolicy = process.env.TEST_ORDER || 'rotate';
 const voteCounts = { alpha: 0, beta: 0 };
 let evaluationMode = '';
 let evaluationRequests = [];
@@ -29,6 +31,7 @@ const mock = http.createServer((req, res) => {
     const phase = system.includes('· 独立回答。') ? 'answer' : system.includes('· 补充回答。') ? 'supplement' : '';
     if (phase) phaseInputs[phase].push(payload.messages[1].content);
     const isVote = payload.messages[0].content.includes('win_res');
+    if (!isVote && !evaluationMode) answerCalls.push(payload.model);
     if (evaluationMode) {
       const retry = payload.messages[0].content.includes('只做一件事');
       if (isVote) evaluationRequests.push({ model: payload.model, budget: payload.max_tokens, retry });
@@ -80,6 +83,11 @@ async function ready() {
   let result;
   try {
     await ready();
+    const invalidOrder = await fetch(base + '/api/experiments', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderPolicy: 'unknown' })
+    });
+    assert.equal(invalidOrder.status, 400);
     const response = await fetch(base + '/api/experiments', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -89,7 +97,7 @@ async function ready() {
           { id: 'gamma', name: 'Gamma', provider: 'deepseek', baseUrl: mockBase }
         ],
         questions: [question],
-        repetitions: tieMode ? 1 : 2, rounds: 1, anonymous: true, maxTokens: 512
+        repetitions: tieMode ? 1 : 2, rounds: 1, anonymous: true, maxTokens: 512, orderPolicy
       })
     });
     assert.equal(response.status, 202);
@@ -119,6 +127,17 @@ async function ready() {
       return;
     }
     assert.equal(result.status, 'completed', result.error);
+    assert.equal(result.orderPolicy, orderPolicy);
+    assert.deepEqual(result.stages[0].runs[0].speakerOrder, ['Alpha', 'Beta', 'Gamma']);
+    assert.deepEqual(result.stages[0].runs[1].speakerOrder, orderPolicy === 'fixed' ? ['Alpha', 'Beta', 'Gamma'] : ['Beta', 'Gamma', 'Alpha']);
+    assert.deepEqual(result.stages[1].runs[0].speakerOrder, ['Beta', 'Gamma']);
+    assert.deepEqual(result.stages[1].runs[1].speakerOrder, orderPolicy === 'fixed' ? ['Beta', 'Gamma'] : ['Gamma', 'Beta']);
+    assert.deepEqual(answerCalls, result.stages.flatMap(stage => stage.runs.flatMap(run =>
+      Array.from({ length: run.discussionRounds }, () => run.speakerOrder.map(name => name.toLowerCase())).flat())), '实际接口调用顺序必须与每场记录一致');
+    for (const stage of result.stages) for (const run of stage.runs) {
+      for (const vote of run.individualVotes) assert.equal(vote.chosenPosition, run.speakerOrder.indexOf(vote.chosen) + 1);
+      for (const entry of run.exchanges) assert.equal(entry.answerPosition, run.speakerOrder.indexOf(entry.model) + 1);
+    }
     assert.deepEqual(result.ranking, ['Alpha', 'Beta', 'Gamma']);
     assert.deepEqual(result.stages[0].candidates, ['Alpha', 'Beta', 'Gamma']);
     assert.deepEqual(result.stages[1].candidates, ['Beta', 'Gamma'], '第一名退出后，剩余模型重新比赛');
@@ -130,6 +149,10 @@ async function ready() {
     const saved = records.find(record => record.id === experimentId);
     assert.equal(saved.status, 'completed');
     assert.deepEqual(saved.models, ['Alpha', 'Beta', 'Gamma']);
+    assert.equal(saved.questionPreview, question.replace(/\s+/g, ' ').trim().slice(0, 240));
+    assert.deepEqual(saved.ranking, result.ranking);
+    assert.equal(saved.protocol, 'same-question-v6');
+    assert.equal(saved.orderPolicy, orderPolicy);
     assert.equal(Object.hasOwn(saved, 'spearman'), false);
     assert.ok(!JSON.stringify(saved).includes('apiKey'));
     assert.equal(result.completedDebates, 4);
@@ -184,6 +207,8 @@ async function ready() {
     assert.match(record, /win_res/);
     assert.match(record, /same-question-v6/);
     assert.match(record, /独立回答/);
+    assert.match(record, /\*\*每轮回答顺序\*\*: 1\. Alpha → 2\. Beta → 3\. Gamma/);
+    assert.ok(record.includes(orderPolicy === 'fixed' ? '**顺序策略**: 固定顺序' : '**顺序策略**: 逐场轮换'));
     assert.ok(!record.includes('**对话对象**'));
     assert.ok(!record.includes('live-only-thinking'), '临时思考过程不得写入 Markdown');
     console.log('PASS: 实验运行过程、讨论记录、投票、排名（无需提供外部榜单）');
@@ -212,6 +237,7 @@ async function ready() {
         }
         const outcome = tracked.result;
         assert.equal(outcome.rounds, 1, '默认每场只独立回答一轮');
+        assert.equal(outcome.orderPolicy, 'rotate', '未提供顺序策略时应保留逐场轮换默认值');
         assert.deepEqual(evaluationRequests.filter(item => item.model === 'kimi-k3').map(item => item.budget), [16384, 32768]);
         if (mode.startsWith('always-')) {
           assert.equal(outcome.status, 'failed');

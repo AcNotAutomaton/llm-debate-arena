@@ -39,6 +39,9 @@
     <span id="roundCountText">3 轮辩论</span>
   </div>
   <div id="debugParameters" class="debug-parameters"></div>
+  <h3>回答顺序</h3>
+  <ol id="debugAnswerOrder" class="answer-order-editor" aria-label="单场回答顺序"></ol>
+  <p id="debugActualOrder" class="answer-order-result" hidden></p>
   <div id="debugOutput"></div>
   </section>
 
@@ -49,6 +52,13 @@
       <div class="view-heading"><p>选择 2–4 个模型。</p><button id="connectModelsBtn" class="btn-secondary" type="button">连接模型</button></div>
       <div id="experimentModelPicker"></div>
       <p id="modelPickerHint" class="hint-text">尚未加载模型，请先连接模型提供方。</p>
+      <h3>起始回答顺序</h3>
+      <ol id="experimentAnswerOrder" class="answer-order-editor" aria-label="实验起始回答顺序"></ol>
+      <label for="experimentOrderPolicy">回答顺序策略</label>
+      <select id="experimentOrderPolicy">
+        <option value="rotate">逐场轮换</option>
+        <option value="fixed">固定顺序</option>
+      </select>
       <label for="experimentQuestions">问题与提示词</label>
       <textarea id="experimentQuestions" rows="6" maxlength="4000" placeholder="输入同一个问题，所有模型独立回答。例如：HTML 中 async 和 defer 有何区别？请说明执行顺序、对页面加载的影响并给出示例。"></textarea>
       <div class="experiment-fields">
@@ -73,7 +83,27 @@
     </div>
   </section>
   </section>
-  <section id="recordsView" class="workspace-view" hidden><div class="view-heading"><div><h2>实验记录</h2><p class="view-description">查看历史排名、阶段票数和完整讨论。</p></div><button id="refreshRecords" class="btn-secondary" type="button">刷新</button></div><div id="recordsList"></div><div id="recordDetail"></div></section>
+  <section id="recordsView" class="workspace-view" hidden aria-labelledby="recordsTitle">
+    <div class="records-heading">
+      <div><h2 id="recordsTitle">实验记录</h2><p id="recordsOverview" class="records-overview">正在读取记录</p></div>
+      <button id="refreshRecords" class="records-icon-button" type="button" title="刷新记录" aria-label="刷新记录"><span data-record-icon="RefreshCw"></span></button>
+    </div>
+    <p id="recordsNotice" class="records-notice" role="status" hidden></p>
+    <div class="records-workspace">
+      <aside id="recordsSidebar" class="records-sidebar" aria-label="实验列表">
+        <div class="records-filters">
+          <label class="records-search"><span data-record-icon="Search"></span><input id="recordsSearch" type="search" placeholder="搜索题目、模型、编号" aria-label="搜索实验记录"></label>
+          <div class="records-filter-row">
+            <select id="recordsStatusFilter" aria-label="记录状态"><option value="all">全部状态</option><option value="completed">已完成</option><option value="active">运行中</option><option value="tied">出现并列</option><option value="failed">失败</option><option value="interrupted">已中断</option></select>
+            <select id="recordsSort" aria-label="记录排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option></select>
+          </div>
+        </div>
+        <p id="recordsMatchCount" class="records-match-count"></p>
+        <div id="recordsList" aria-label="实验记录列表"></div>
+      </aside>
+      <div id="recordDetail" class="record-detail" aria-live="polite"></div>
+    </div>
+  </section>
 
   <div class="progress-bar" id="progressBar" style="display:none">
     <div class="progress-fill" id="progressFill"></div>
@@ -145,7 +175,6 @@
   </div>
 </div>
 
-<script src="app.js"></script>
-<script src="workspace.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>
