@@ -1,3 +1,5 @@
+const { answerGuidance } = require('../protocols/answer-policy.cjs');
+
 function buildSystemPrompt(identifier, stepNum, totalSteps, anonymous) {
   let base, suffix;
   if (anonymous) {
@@ -10,9 +12,9 @@ function buildSystemPrompt(identifier, stepNum, totalSteps, anonymous) {
   // 禁止思考过程泄漏到正文：推理模型（如 glm-5）有时会把英文思考链
   // （”Let me analyze...” “Let me draft...”）写到 content 字段而非 reasoning_content，
   // 导致数万字思考占用 max_tokens、正文一行未写就被截断。
-  var noThink = `\n\n重要：直接输出你的辩论发言正文。不要输出任何思考过程、内部独白、分析步骤或英文草稿（如”Let me analyze...”、”Let me draft...”、”Now I need to write...”等）。不要使用  标签。你的回复内容会直接作为辩论发言展示给观众，请像在公开论坛上发表观点一样直接书写。`;
-  if (stepNum === 1) return `${base}${suffix}${noThink}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
-  return `${base}${suffix}${noThink}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
+  var noThink = `\n\n重要：直接输出你的辩论发言正文。不要输出内部思考过程、内部独白或英文草稿（如”Let me analyze...”、”Let me draft...”、”Now I need to write...”等）。不要使用  标签。你的回复内容会直接作为辩论发言展示给观众，请像在公开论坛上发表观点一样直接书写。`;
+  if (stepNum === 1) return `${base}${suffix}${noThink}\n\n${answerGuidance}\n\n现在请你直接针对问题给出你的全面分析和观点。`;
+  return `${base}${suffix}${noThink}\n\n${answerGuidance}\n\n请基于之前的讨论继续深入分析，提出你的观点。`;
 }
 
 function buildUserPrompt(question, identifier, history, anonymous) {

@@ -8,17 +8,18 @@ const dir = path.join(root, 'experiments');
 const names = ['A', 'B', 'C', 'D'];
 try {
   fs.mkdirSync(dir);
-  const save = (n, status, ranking, date) => {
+  const save = (n, status, ranking, date, protocol = n === 1 ? 'same-question-v6' : 'reciprocal-qa-v5') => {
     const filename = `00000000-0000-0000-0000-${String(n).padStart(12, '0')}.json`;
     fs.writeFileSync(path.join(dir, filename), JSON.stringify({ status, ranking,
       models: names.slice(0, ranking.length).map(name => ({ name })),
-      updatedAt: date, protocol: n === 1 ? 'same-question-v6' : 'reciprocal-qa-v5', questions: ['题目|含换行\n和代码 <div>'] }));
+      updatedAt: date, protocol, questions: ['题目|含换行\n和代码 <div>'] }));
   };
   save(1, 'completed', names, '2026-10-04T10:00:00Z');
   save(2, 'completed', ['B', 'A'], '2026-10-05T10:00:00Z');
   save(3, 'running', names, '2026-10-06T10:00:00Z');
   save(4, 'tied', names, '2026-10-06T10:00:00Z');
   save(5, 'completed', ['A', 'A'], '2026-10-06T10:00:00Z');
+  save(7, 'completed', names, '2026-10-03T10:00:00Z', 'same-question-v7');
   fs.writeFileSync(path.join(dir, '00000000-0000-0000-0000-000000000006.json'), '{broken');
   const file = updateRankingSummary(root);
   assert.equal(file, path.join(root, 'debates', '排名实验汇总.md'));
@@ -30,6 +31,8 @@ try {
   assert.match(first, /题目&#124;含换行 和代码 &lt;div&gt;/);
   assert.match(first, /\]\(\.\.\/experiments\//);
   assert.match(first, /同题回答/);
+  assert.match(first, /同题回答（自由篇幅）/);
+  assert.match(first, /同题回答（限定篇幅）/);
   assert.match(first, /对称问答/);
   updateRankingSummary(root);
   assert.equal(fs.readFileSync(file, 'utf8'), first, '重复生成不得产生重复记录');

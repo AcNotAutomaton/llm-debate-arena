@@ -279,6 +279,7 @@ export function createDebugUI({ updateConfigSummary }) {
 
   function showResults(data) {
     var html = '';
+    if (data.recordError) html += '<div class="judge-text">' + escapeHtml(data.recordError) + '，请检查服务日志。</div>';
     if (data.aborted) html += '<div class="judge-text">辩论中断：' + escapeHtml(data.errorMessage || '未知错误') + '</div>';
     var judgeText = data.judgeText || '';
     var evaluations = data.evaluations || [];

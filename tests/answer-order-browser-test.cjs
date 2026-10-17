@@ -11,7 +11,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   const models = ['Alpha', 'Beta', 'Gamma'].map(name => ({ id: name.toLowerCase(), name, provider: 'deepseek' }));
   let experimentRequest, debugRequest;
   const run = { speakerOrder: ['Beta', 'Alpha', 'Gamma'], votes: { Beta: 1, Alpha: 2, Gamma: 0 }, questionIndex: 1, repeat: 1, discussionRounds: 1, recordFile: '2026-10-12_00-00-00-12345678.md' };
-  const data = { id: 'browser-mock', status: 'completed', models: [models[1], models[0], models[2]], protocol: 'same-question-v6', orderPolicy: 'fixed', ranking: ['Alpha', 'Beta', 'Gamma'], totalDebates: 1, completedDebates: 1,
+  const data = { id: 'browser-mock', status: 'completed', models: [models[1], models[0], models[2]], protocol: 'same-question-v7', orderPolicy: 'fixed', ranking: ['Alpha', 'Beta', 'Gamma'], totalDebates: 1, completedDebates: 1,
     stages: [{ position: 1, candidates: ['Beta', 'Alpha', 'Gamma'], votes: run.votes, winner: 'Alpha', runs: [run] }], current: null, liveChat: null };
   await page.route('**/api/test-connection', route => route.fulfill({ json: { success: true, models } }));
   await page.route('**/api/experiments', route => {
@@ -22,6 +22,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     return route.fulfill({ json: [{ id: data.id, createdAt: new Date().toISOString(), status: data.status, models: data.models.map(m => m.name), completedDebates: 1, totalDebates: 1 }] });
   });
   await page.route('**/api/experiments/browser-mock', route => route.fulfill({ json: data }));
+  await page.route('**/api/records', route => route.fulfill({ json: [{ id: data.id, createdAt: new Date().toISOString(), status: data.status, models: data.models.map(m => m.name), completedDebates: 1, totalDebates: 1 }] }));
+  await page.route('**/api/records/browser-mock', route => route.fulfill({ json: data }));
   await page.route('**/api/debate', route => {
     debugRequest = route.request().postDataJSON();
     return route.fulfill({ json: { debateId: 'debug-mock' } });
@@ -56,6 +58,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.getByRole('button', { name: '排名实验', exact: true }).click();
     await page.locator('#startExperimentBtn').click();
     await page.locator('#experimentResult details').waitFor();
+    assert.match(await page.locator('#experimentStatus').textContent(), /自由篇幅/);
     assert.equal(experimentRequest.orderPolicy, 'fixed');
     assert.deepEqual(experimentRequest.models.map(m => m.name), ['Beta', 'Alpha', 'Gamma']);
     await page.locator('#experimentResult details > summary').click();
@@ -70,8 +73,10 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.getByRole('button', { name: '实验记录', exact: true }).click();
     await page.locator('.record-row').click();
     await page.locator('#recordDetail .record-run').waitFor();
+    assert.match(await page.locator('.record-detail-title').textContent(), /自由篇幅/);
     assert.match(await page.locator('#recordDetail .record-run-order li').nth(1).textContent(), /2Alpha2票/);
     await page.getByRole('tab', { name: '原题与参数' }).click();
+    assert.match(await page.locator('.record-parameters').textContent(), /same-question-v7/);
     assert.match(await page.locator('.record-initial-order').textContent(), /1\. Beta → 2\. Alpha → 3\. Gamma/);
     await page.getByRole('tab', { name: '回答位置' }).click();
     assert.equal(await page.locator('#recordDetail .answer-order-table tbody tr').count(), 3);

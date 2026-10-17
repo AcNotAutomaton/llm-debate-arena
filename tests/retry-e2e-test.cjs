@@ -12,6 +12,7 @@ const MOCK_PORT = 9876;
 const ARENA_PORT = 4567;
 const MOCK_BASE = `http://127.0.0.1:${MOCK_PORT}`;
 const ARENA_BASE = `http://127.0.0.1:${ARENA_PORT}`;
+const createdDebates = new Set();
 
 function writeSse(res, text) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -114,12 +115,9 @@ async function collectSseEvents(url, untilEvent, timeoutMs) {
 function cleanupTestDebates() {
   const dir = path.join(__dirname, '..', 'debates');
   if (!fs.existsSync(dir)) return;
-  const cutoff = Date.now() - 5 * 60 * 1000;
   for (const name of fs.readdirSync(dir)) {
-    if (!name.endsWith('.md')) continue;
+    if (![...createdDebates].some(id => name === `debug-${id}.json` || name.endsWith(id.slice(0, 8) + '.md'))) continue;
     const full = path.join(dir, name);
-    const st = fs.statSync(full);
-    if (st.mtimeMs < cutoff) continue;
     const content = fs.readFileSync(full, 'utf8');
     if (content.includes('测试辩题：排满还是留白')) fs.unlinkSync(full);
   }
@@ -156,6 +154,7 @@ function cleanupTestDebates() {
     });
     if (!startResp.ok) throw new Error('start debate failed: HTTP ' + startResp.status);
     const { debateId } = await startResp.json();
+    createdDebates.add(debateId);
     const events = await collectSseEvents(`${ARENA_BASE}/api/debate/${debateId}/stream`, 'debate-end', 90000);
 
     const retries = events.filter(e => e.event === 'model-retry' && e.data.model === 'Flaky');
@@ -186,6 +185,7 @@ function cleanupTestDebates() {
       });
       assert.ok(response.ok);
       const id = (await response.json()).debateId;
+      createdDebates.add(id);
       const observed = await collectSseEvents(`${ARENA_BASE}/api/debate/${id}/stream`, 'debate-end', 90000);
       const retried = observed.filter(event => event.event === 'model-retry' && event.data.round === 1);
       const ended = observed.find(event => event.event === 'debate-end');
@@ -196,7 +196,7 @@ function cleanupTestDebates() {
         assert.equal(observed.find(event => event.event === 'model-error').data.partialText, 'partial-network-output');
         assert.ok(!observed.some(event => event.event === 'model-done'));
         assert.ok(!observed.some(event => event.event === 'model-eval-start'));
-        // debate-end 先于文件保存；等待这一个测试的存档落盘。
+        // The terminal event is emitted only after the record has been saved.
         const dir = path.join(__dirname, '..', 'debates');
         let record;
         for (let attempt = 0; attempt < 30 && !record; attempt++) {

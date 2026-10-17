@@ -414,6 +414,13 @@ button:focus-visible, summary:focus-visible { outline: 2px solid #818cf8; outlin
 .records-search input::placeholder { color: var(--rec-muted); }
 .records-filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
 .records-filter-row select { width: 100%; min-width: 0; padding: 7px 6px; border: 1px solid var(--rec-line); border-radius: 4px; background: var(--rec-surface); color: var(--rec-muted); font: inherit; font-size: 12px; }
+#recordsTypeFilter { width: 100%; margin-top: 10px; padding: 7px 6px; border: 1px solid var(--rec-line); border-radius: 4px; background: var(--rec-surface); color: var(--rec-muted); font: inherit; font-size: 12px; }
+.record-type { display: block; margin-top: 6px; font-size: 10px; color: var(--rec-accent); }
+.record-transcript { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 13px; line-height: 1.9; padding: 14px 0; }
+.record-speech { border-bottom: 1px solid var(--rec-line); }
+.record-speech summary { padding: 14px 0; font-size: 12px; overflow-wrap: anywhere; }
+.record-debug-results { margin: 24px 0; }
+.record-archive-note { margin-bottom: 12px; }
 .records-match-count { padding: 0 16px 10px; color: var(--rec-muted); font-size: 11px; }
 #recordsList { max-height: 72vh; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--rec-line) transparent; }
 .record-date-group { padding: 14px 16px 7px; color: var(--rec-muted); font-size: 11px; }

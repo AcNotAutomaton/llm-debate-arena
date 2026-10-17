@@ -5,13 +5,13 @@ function createExperimentService({ runtime, startDebate, recordStore }) {
   const { sessions, sseClients, experiments, experimentChats } = runtime;
   const { saveExperiment } = recordStore;
 
-  function createExperiment({ models, questions, repetitions, rounds, temperature, maxTokens, wordLimit, orderPolicy }) {
+  function createExperiment({ models, questions, repetitions, rounds, temperature, maxTokens, orderPolicy }) {
     const id = crypto.randomUUID();
     const experiment = {
       id, status: 'pending', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
       models: models.map(m => ({ id: m.id, name: m.name, provider: m.provider })),
       questions: questions.map(q => q.trim()), repetitions, rounds, temperature, maxTokens, orderPolicy,
-      anonymous: true, protocol: experimentProtocol.protocol, wordLimit, rubric: experimentProtocol.rubric,
+      anonymous: true, protocol: experimentProtocol.protocol, rubric: experimentProtocol.rubric,
       totalDebates: questions.length * repetitions * (models.length - 1),
       completedDebates: 0, stages: [], ranking: []
     };
@@ -53,7 +53,7 @@ function createExperimentService({ runtime, startDebate, recordStore }) {
               maxTokens: experiment.maxTokens, anonymous: experiment.anonymous,
               status: 'pending', history: [], evaluations: [], createdAt: Date.now(),
               captureEvents: false, skipJudge: true, experimentId: experiment.id,
-              protocol: experiment.protocol, wordLimit: experiment.wordLimit, rubric: experiment.rubric,
+              protocol: experiment.protocol, rubric: experiment.rubric,
               orderPolicy: experiment.orderPolicy
             };
             sessions.set(debateId, session);

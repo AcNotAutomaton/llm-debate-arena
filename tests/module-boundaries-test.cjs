@@ -44,6 +44,14 @@ const close = server => new Promise((resolve, reject) => {
 
   const apiSource = fs.readFileSync(path.join(__dirname, '../public/core/api.js'), 'utf8');
   const api = await import('data:text/javascript;base64,' + Buffer.from(apiSource).toString('base64'));
+  const formatSource = fs.readFileSync(path.join(__dirname, '../public/core/format.js'), 'utf8');
+  const format = await import('data:text/javascript;base64,' + Buffer.from(formatSource).toString('base64'));
+  assert.match(format.experimentModeName('same-question-v7'), /自由篇幅/);
+  assert.match(format.experimentModeName('same-question-v6'), /限定篇幅/);
+  assert.equal(format.experimentModeName('reciprocal-qa-v5'), '对称问答');
+  assert.equal(format.isSameQuestionProtocol('same-question-v7'), true);
+  assert.equal(format.isSameQuestionProtocol('same-question-v6'), true);
+  assert.equal(format.isSameQuestionProtocol('reciprocal-qa-v5'), false);
   const originalFetch = globalThis.fetch;
   const originalEventSource = globalThis.EventSource;
   try {
@@ -55,6 +63,8 @@ const close = server => new Promise((resolve, reject) => {
     globalThis.fetch = async url => { requested = url; return new Response(JSON.stringify({ id: 'saved' })); };
     assert.equal((await api.readExperiment('a/b')).id, 'saved');
     assert.equal(requested, '/api/experiments/a%2Fb');
+    assert.equal((await api.readRecord('a/b')).id, 'saved');
+    assert.equal(requested, '/api/records/a%2Fb');
     globalThis.EventSource = class { constructor(url) { this.url = url; } };
     assert.equal(api.openDebateStream('a/b').url, '/api/debate/a%2Fb/stream');
   } finally {

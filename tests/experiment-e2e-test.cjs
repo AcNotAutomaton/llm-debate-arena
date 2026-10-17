@@ -97,7 +97,7 @@ async function ready() {
           { id: 'gamma', name: 'Gamma', provider: 'deepseek', baseUrl: mockBase }
         ],
         questions: [question],
-        repetitions: tieMode ? 1 : 2, rounds: 1, anonymous: true, maxTokens: 512, orderPolicy
+        repetitions: tieMode ? 1 : 2, rounds: 1, anonymous: true, maxTokens: 512, wordLimit: 50, orderPolicy
       })
     });
     assert.equal(response.status, 202);
@@ -151,7 +151,7 @@ async function ready() {
     assert.deepEqual(saved.models, ['Alpha', 'Beta', 'Gamma']);
     assert.equal(saved.questionPreview, question.replace(/\s+/g, ' ').trim().slice(0, 240));
     assert.deepEqual(saved.ranking, result.ranking);
-    assert.equal(saved.protocol, 'same-question-v6');
+    assert.equal(saved.protocol, 'same-question-v7');
     assert.equal(saved.orderPolicy, orderPolicy);
     assert.equal(Object.hasOwn(saved, 'spearman'), false);
     assert.ok(!JSON.stringify(saved).includes('apiKey'));
@@ -178,10 +178,15 @@ async function ready() {
     assert.equal(result.current.phase, '本场已结束');
     assert.equal(result.current.speeches.length, tieMode ? 4 : 2);
     assert.equal(result.current.evaluations.length, 2);
-    assert.equal(result.protocol, 'same-question-v6');
+    assert.equal(result.protocol, 'same-question-v7');
+    assert.equal(Object.hasOwn(result, 'wordLimit'), false, '旧客户端传入的 wordLimit 不再生效或保存');
+    assert.equal(result.maxTokens, 512, '取消字数限制不改变 Token 配置');
     assert.equal(Object.hasOwn(result, 'domainLabel'), false);
     assert.equal(result.rubric, rubric);
     assert.ok(experimentPrompts.every(prompt => prompt.includes(rubric)), '独立回答、讨论和互评必须使用本实验标准');
+    assert.ok(experimentPrompts.every(prompt => !/正文目标不超过|最多\s*3\s*个要点/.test(prompt)), '不能残留正文篇幅限制');
+    assert.ok(experimentPrompts.filter(prompt => !prompt.includes('win_res')).every(prompt => prompt.includes('自行决定回答长度和组织方式')));
+    assert.ok(experimentPrompts.filter(prompt => prompt.includes('win_res')).every(prompt => prompt.includes('正文控制在800字以内')), '互评约束保持不变');
     assert.ok(experimentPrompts.every(prompt => !prompt.includes('HTML/CSS/JavaScript')), '用户提示词不应混入固定前端提示');
     for (const [phase, inputs] of Object.entries(phaseInputs)) {
       assert.equal(inputs.length, phase === 'answer' ? 10 : tieMode ? 5 : 0, '每人每轮回答一次：' + phase);
@@ -205,7 +210,7 @@ async function ready() {
     assert.ok(record.includes(question), 'Markdown 必须保存完整多行提示词');
     assert.match(record, /来自 alpha 的发言/);
     assert.match(record, /win_res/);
-    assert.match(record, /same-question-v6/);
+    assert.match(record, /same-question-v7/);
     assert.match(record, /独立回答/);
     assert.match(record, /\*\*每轮回答顺序\*\*: 1\. Alpha → 2\. Beta → 3\. Gamma/);
     assert.ok(record.includes(orderPolicy === 'fixed' ? '**顺序策略**: 固定顺序' : '**顺序策略**: 逐场轮换'));

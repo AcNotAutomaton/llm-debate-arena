@@ -1,7 +1,7 @@
 import { state } from '../core/state.js';
 import { q, escapeHtml, experimentQuestions, experimentRepeats, experimentRounds, experimentEstimate, startExperimentBtn, experimentStatus, experimentLive, experimentResult } from '../core/dom.js';
 import { fetchJSON, readExperiment } from '../core/api.js';
-import { experimentModeName } from '../core/format.js';
+import { experimentModeName, isSameQuestionProtocol } from '../core/format.js';
 import { answerOrderPolicyName, answerOrderText, stageOrderStatsHtml, runOrderResultsHtml } from '../answer-order.js';
 
 export function createExperimentUI({ updateConfigSummary }) {
@@ -49,7 +49,7 @@ export function createExperimentUI({ updateConfigSummary }) {
       html += `<details><summary>第 ${stage.position} 名：${stage.winner ? escapeHtml(stage.winner) : "统计中"}（${stage.runs.length} 场）</summary>`;
       html += '<div class="stage-votes">' + Object.entries(stage.votes).map(([name, count]) => `<span>${escapeHtml(name)}：${count} 票</span>`).join("") + '</div>';
       html += stageOrderStatsHtml(stage);
-      html += '<ol>' + stage.runs.map(run => `<li>辩题 ${run.questionIndex} · ${run.tiebreak ? `加赛 ${run.tiebreak}` : `重复 ${run.repeat}`}${run.discussionRounds ? ` · ${data.protocol === 'same-question-v6' ? '回答' : data.protocol === 'reciprocal-qa-v5' ? '问答' : '讨论'} ${run.discussionRounds} 轮` : ''} · ${Object.entries(run.votes).map(([name, count]) => `${escapeHtml(name)} ${count}`).join(" / ")} · ${run.recordFile ? `<a href="/api/debate-records/${encodeURIComponent(run.recordFile)}" target="_blank" rel="noopener">查看完整讨论记录</a>` : '<span>记录未保存</span>'}${runOrderResultsHtml(run)}</li>`).join("") + '</ol></details>';
+      html += '<ol>' + stage.runs.map(run => `<li>辩题 ${run.questionIndex} · ${run.tiebreak ? `加赛 ${run.tiebreak}` : `重复 ${run.repeat}`}${run.discussionRounds ? ` · ${isSameQuestionProtocol(data.protocol) ? '回答' : data.protocol === 'reciprocal-qa-v5' ? '问答' : '讨论'} ${run.discussionRounds} 轮` : ''} · ${Object.entries(run.votes).map(([name, count]) => `${escapeHtml(name)} ${count}`).join(" / ")} · ${run.recordFile ? `<a href="/api/debate-records/${encodeURIComponent(run.recordFile)}" target="_blank" rel="noopener">查看完整讨论记录</a>` : '<span>记录未保存</span>'}${runOrderResultsHtml(run)}</li>`).join("") + '</ol></details>';
     }
     experimentResult.innerHTML = html;
   }
@@ -101,7 +101,7 @@ export function createExperimentUI({ updateConfigSummary }) {
       liveDebateId = current.debateId;
       experimentLive.innerHTML = '<h3>当前场次</h3><p class="live-meta"></p><p class="live-order"></p><p class="live-question"></p><div class="live-speeches"></div><p class="live-phase"></p><pre class="live-text"></pre><div class="live-evaluations"></div>';
     }
-    experimentLive.querySelector('.live-meta').textContent = `第 ${current.stage} 阶段 · 辩题 ${current.questionIndex} · ${current.tiebreak ? `第 ${current.tiebreak} 次加赛` : `第 ${current.repeat} 次重复`}${current.discussionRounds ? ` · ${protocol === 'same-question-v6' ? '回答' : protocol === 'reciprocal-qa-v5' ? '问答' : '讨论'} ${current.discussionRounds} 轮` : ''} · 匿名对照：${current.speakerOrder.map((name, i) => `${String.fromCharCode(65 + i)}=${name}`).join('；')}`;
+    experimentLive.querySelector('.live-meta').textContent = `第 ${current.stage} 阶段 · 辩题 ${current.questionIndex} · ${current.tiebreak ? `第 ${current.tiebreak} 次加赛` : `第 ${current.repeat} 次重复`}${current.discussionRounds ? ` · ${isSameQuestionProtocol(protocol) ? '回答' : protocol === 'reciprocal-qa-v5' ? '问答' : '讨论'} ${current.discussionRounds} 轮` : ''} · 匿名对照：${current.speakerOrder.map((name, i) => `${String.fromCharCode(65 + i)}=${name}`).join('；')}`;
     experimentLive.querySelector('.live-question').textContent = `辩题：${current.question}`;
     experimentLive.querySelector('.live-order').textContent = '本场每轮回答顺序：' + answerOrderText(current.speakerOrder);
     experimentLive.querySelector('.live-phase').textContent = `${current.phase} · 第 ${current.step}/${current.totalSteps} 步${current.model ? ' · ' + current.model : ''}${current.partner ? ' → ' + current.partner : ''}${current.error ? ' · ' + current.error : ''}`;

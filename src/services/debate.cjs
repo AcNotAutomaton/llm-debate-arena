@@ -2,12 +2,20 @@ const experimentProtocol = require('../protocols/experiment-protocol.cjs');
 const { effectiveMaxTokens } = require('../providers/token-budget.cjs');
 const { buildSystemPrompt, buildUserPrompt } = require('./prompts.cjs');
 
-function createDebateService({ sessions, emit, modelClient, evaluation, recordStore }) {
+function createDebateService({ sessions, emit, modelClient, evaluation, recordStore, debugStore }) {
   const { callModel, getModelCallConfig } = modelClient;
   const { runJudge, evaluateModels } = evaluation;
   async function startDebate(debateId) {
     const s = sessions.get(debateId);
     if (!s) return;
+    function finish(data) {
+      s.recordFile = recordStore.saveDebate(debateId, s);
+      if (!s.experimentId) {
+        try { debugStore.save(s); }
+        catch (error) { console.error('单场记录保存失败:', error.message); data.recordError = '单场记录保存失败'; }
+      }
+      emit(debateId, 'debate-end', data);
+    }
     s.status = 'running';
     s.history = [];
     s.aborted = false;
@@ -27,7 +35,7 @@ function createDebateService({ sessions, emit, modelClient, evaluation, recordSt
       const phase = turn?.phase || '讨论中';
       const partner = turn?.partnerIndex != null ? s.labels[turn.partnerIndex] : '';
       emit(debateId, 'round-start', { turn: turnNum, totalTurns: totalSteps, model: model.name, phase, partner });
-      const msgs = turn ? experimentProtocol.messagesFor(s.question, s.labels, s.history, turn, s.wordLimit) : [
+      const msgs = turn ? experimentProtocol.messagesFor(s.question, s.labels, s.history, turn) : [
         { role: 'system', content: buildSystemPrompt(identifier, turnNum, totalSteps, anonymous) },
         { role: 'user', content: buildUserPrompt(s.question, identifier, s.history, anonymous) }
       ];
@@ -51,7 +59,7 @@ function createDebateService({ sessions, emit, modelClient, evaluation, recordSt
     }
     if (s.aborted) {
       s.status = 'aborted';
-      emit(debateId, 'debate-end', { aborted: true, errorMessage: s.history[s.history.length - 1]?.content || '未知错误' });
+      finish({ aborted: true, errorMessage: s.history[s.history.length - 1]?.content || '未知错误' });
     } else {
       s.status = 'completed';
       try {
@@ -59,20 +67,18 @@ function createDebateService({ sessions, emit, modelClient, evaluation, recordSt
       } catch (e) { console.error('Eval failed:', e.message); }
       if (s.aborted) {
         s.status = 'aborted';
-        emit(debateId, 'debate-end', { aborted: true, errorMessage: s.evaluations.at(-1)?.evaluation || '互评中断' });
+        finish({ aborted: true, errorMessage: s.evaluations.at(-1)?.evaluation || '互评中断' });
       } else if (s.skipJudge) {
-        emit(debateId, 'debate-end', { judgeText: '', scores: {}, winner: '', evaluations: s.evaluations || [] });
+        finish({ judgeText: '', scores: {}, winner: '', evaluations: s.evaluations || [] });
       } else {
         try {
           await runJudge(debateId, s);
-          emit(debateId, 'debate-end', { judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
+          finish({ judgeText: s.judgeResult.judgeText, scores: s.judgeResult.scores, winner: s.judgeResult.winner, evaluations: s.evaluations || [] });
         } catch (e) {
-          emit(debateId, 'debate-end', { judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
+          finish({ judgeText: '\u88c1\u5224\u5931\u8d25', scores: {}, winner: '', evaluations: s.evaluations || [] });
         }
       }
     }
-    s.recordFile = recordStore.saveDebate(debateId, s);
-
     return s;
   }
 

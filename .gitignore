@@ -30,6 +30,7 @@ experiments/
 
 # Local agent workspace and temporary exports
 .agents/
+.artifacts/
 .artifact_runtime/
 outputs/
 result.csv

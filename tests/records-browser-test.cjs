@@ -32,8 +32,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
   }));
   let listMode = 'normal';
   let slowFirst = false;
-  await page.route('**/api/experiments', route => listMode === 'error' ? route.fulfill({ status: 503, contentType: 'text/plain', body: 'upstream unavailable' }) : route.fulfill({ json: listMode === 'empty' ? [] : records.map(record => ({ id: record.id, createdAt: record.createdAt, status: record.status, models: names, questionPreview: record.questions[0], ranking: record.ranking, completedDebates: record.completedDebates, totalDebates: record.totalDebates })) }));
-  await page.route('**/api/experiments/record-*', async route => {
+  await page.route('**/api/records', route => listMode === 'error' ? route.fulfill({ status: 503, contentType: 'text/plain', body: 'upstream unavailable' }) : route.fulfill({ json: listMode === 'empty' ? [] : records.map(record => ({ id: record.id, createdAt: record.createdAt, status: record.status, models: names, questionPreview: record.questions[0], ranking: record.ranking, completedDebates: record.completedDebates, totalDebates: record.totalDebates })) }));
+  await page.route('**/api/records/record-*', async route => {
     const record = records.find(item => route.request().url().endsWith('/' + item.id));
     if (slowFirst && record.id === 'record-0') await new Promise(resolve => setTimeout(resolve, 250));
     return route.fulfill(record.id === 'record-7' ? { status: 404, json: { error: '记录不存在' } } : { json: record });
@@ -49,6 +49,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
     await page.goto(process.env.ARENA_URL || 'http://localhost:3458');
     await page.getByRole('button', { name: '实验记录', exact: true }).click();
     await page.locator('.record-ranking li').first().waitFor();
+    assert.match(await page.locator('.record-detail-title').textContent(), /限定篇幅/);
     assert.equal(await page.locator('.record-row').count(), 8);
     assert.equal(await page.locator('.record-ranking li').count(), 4);
     assert.equal(await page.locator('.record-stage').count(), 3);

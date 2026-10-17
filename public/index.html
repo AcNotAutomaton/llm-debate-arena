@@ -93,8 +93,9 @@
       <aside id="recordsSidebar" class="records-sidebar" aria-label="实验列表">
         <div class="records-filters">
           <label class="records-search"><span data-record-icon="Search"></span><input id="recordsSearch" type="search" placeholder="搜索题目、模型、编号" aria-label="搜索实验记录"></label>
+          <select id="recordsTypeFilter" aria-label="记录类型"><option value="all">全部类型</option><option value="experiment">排名实验</option><option value="debug">单场调试</option></select>
           <div class="records-filter-row">
-            <select id="recordsStatusFilter" aria-label="记录状态"><option value="all">全部状态</option><option value="completed">已完成</option><option value="active">运行中</option><option value="tied">出现并列</option><option value="failed">失败</option><option value="interrupted">已中断</option></select>
+            <select id="recordsStatusFilter" aria-label="记录状态"><option value="all">全部状态</option><option value="completed">已完成</option><option value="archived">历史归档</option><option value="active">运行中</option><option value="tied">出现并列</option><option value="failed">失败</option><option value="interrupted">已中断</option></select>
             <select id="recordsSort" aria-label="记录排序"><option value="newest">最新优先</option><option value="oldest">最早优先</option></select>
           </div>
         </div>

@@ -11,6 +11,12 @@ export async function readExperiment(id) {
   return data;
 }
 
+export async function readRecord(id) {
+  const { response, data } = await fetchJSON('/api/records/' + encodeURIComponent(id));
+  if (!response.ok) throw new Error(data.error || '无法读取记录');
+  return data;
+}
+
 export function openDebateStream(id) {
   return new EventSource('/api/debate/' + encodeURIComponent(id) + '/stream');
 }

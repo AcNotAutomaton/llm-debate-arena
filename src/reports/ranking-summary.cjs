@@ -32,7 +32,7 @@ function updateRankingSummary(root = path.resolve(__dirname, '../..')) {
   for (const row of rows) {
     const prompt = (row.questions || []).join(' / ').replace(/\s+/g, ' ').trim();
     const excerpt = prompt.length > 100 ? prompt.slice(0, 100) + '…' : prompt;
-    const mode = row.protocol === 'same-question-v6' ? '同题回答' : row.protocol === 'reciprocal-qa-v5' ? '对称问答' : '旧讨论方式';
+    const mode = row.protocol === 'same-question-v7' ? '同题回答（自由篇幅）' : row.protocol === 'same-question-v6' ? '同题回答（限定篇幅）' : row.protocol === 'reciprocal-qa-v5' ? '对称问答' : '旧讨论方式';
     lines.push(`| ${time(row.updatedAt || row.createdAt)} | ${[0, 1, 2, 3].map(i => cell(row.ranking[i] || '—')).join(' | ')} | ${cell(excerpt)} | ${mode} | [${row.filename.slice(0, -5)}](../experiments/${row.filename}) |`);
   }
   if (!rows.length) lines.push('', '暂无已完成的完整排名。');
